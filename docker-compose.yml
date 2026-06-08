@@ -1,0 +1,20 @@
+services:
+  pipeline:
+    build: .
+    env_file: .env
+    volumes:
+      - ./data:/data
+    environment:
+      - DATA_DIR=/data
+    restart: unless-stopped
+    command: ["--daemon"]
+
+  run-once:
+    build: .
+    env_file: .env
+    volumes:
+      - ./data:/data
+    environment:
+      - DATA_DIR=/data
+    profiles: ["once"]
+    command: ["--once"]

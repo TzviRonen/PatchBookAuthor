@@ -1,0 +1,160 @@
+#!/usr/bin/env bash
+# Interactive management script for the claude-sandbox container.
+# Usage: ./container.sh [start|stop|shell|status|rebuild|logs]
+
+set -euo pipefail
+
+IMAGE_NAME="claude-sandbox"
+CONTAINER_NAME="claude-sandbox"
+WORKSPACE="$(cd "$(dirname "$0")" && pwd)"
+
+# ── helpers ────────────────────────────────────────────────────────────────
+
+container_state() {
+    local status
+    if status=$(docker inspect -f '{{.State.Status}}' "$CONTAINER_NAME" 2>/dev/null) && [[ -n "$status" ]]; then
+        echo "$status"
+    else
+        echo "missing"
+    fi
+}
+
+build_image() {
+    echo "[*] Building image '$IMAGE_NAME'..."
+    docker build -t "$IMAGE_NAME" "$WORKSPACE/.devcontainer"
+}
+
+ensure_running() {
+    if ! docker image inspect "$IMAGE_NAME" &>/dev/null; then
+        build_image
+    fi
+    local state
+    state=$(container_state)
+    case "$state" in
+        running) ;;
+        exited|created|paused)
+            echo "[*] Starting container..."
+            docker start "$CONTAINER_NAME" > /dev/null
+            ;;
+        missing)
+            echo "[*] Creating container..."
+            docker run -d \
+                --name "$CONTAINER_NAME" \
+                --cap-add=SYS_PTRACE \
+                --security-opt seccomp=unconfined \
+                -v "$WORKSPACE:/workspace" \
+                -v "$HOME/.claude:/home/sandbox/.claude" \
+                -v "$HOME/.claude.json:/home/sandbox/.claude.json" \
+                -e "ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}" \
+                -w /workspace \
+                "$IMAGE_NAME" \
+                sleep infinity > /dev/null
+            ;;
+        *)
+            echo "[!] Unexpected state '$state'. Removing and recreating..."
+            docker rm -f "$CONTAINER_NAME" > /dev/null
+            ensure_running
+            ;;
+    esac
+}
+
+print_status() {
+    local state
+    state=$(container_state)
+    local image_exists="no"
+    docker image inspect "$IMAGE_NAME" &>/dev/null && image_exists="yes"
+    echo "  Image:     $IMAGE_NAME  (exists: $image_exists)"
+    echo "  Container: $CONTAINER_NAME  (state: $state)"
+}
+
+# ── commands ───────────────────────────────────────────────────────────────
+
+cmd_start() {
+    ensure_running
+    echo "[*] Container is running."
+}
+
+cmd_stop() {
+    local state
+    state=$(container_state)
+    if [[ "$state" == "missing" ]]; then
+        echo "[*] Container does not exist."
+    elif [[ "$state" == "exited" ]]; then
+        echo "[*] Container is already stopped."
+    else
+        echo "[*] Stopping container..."
+        docker stop "$CONTAINER_NAME" > /dev/null
+        echo "[*] Stopped."
+    fi
+}
+
+cmd_shell() {
+    ensure_running
+    echo "[*] Opening terminal in '$CONTAINER_NAME'..."
+    docker exec -it "$CONTAINER_NAME" bash
+}
+
+cmd_status() {
+    echo ""
+    print_status
+    echo ""
+}
+
+cmd_rebuild() {
+    echo "[*] Stopping and removing container..."
+    docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
+    echo "[*] Removing image..."
+    docker rmi -f "$IMAGE_NAME" 2>/dev/null || true
+    build_image
+    echo "[*] Rebuild complete. Run './container.sh start' or './container.sh shell' to use it."
+}
+
+cmd_logs() {
+    docker logs --tail=50 -f "$CONTAINER_NAME"
+}
+
+# ── interactive menu ────────────────────────────────────────────────────────
+
+interactive_menu() {
+    while true; do
+        echo ""
+        echo "  Claude Sandbox — Container Manager"
+        echo "  ==================================="
+        print_status
+        echo ""
+        echo "  1) Open terminal (shell)"
+        echo "  2) Start container"
+        echo "  3) Stop container"
+        echo "  4) Rebuild image"
+        echo "  5) Show logs"
+        echo "  q) Quit"
+        echo ""
+        read -rp "  Choice: " choice
+        case "$choice" in
+            1) cmd_shell ;;
+            2) cmd_start ;;
+            3) cmd_stop ;;
+            4) cmd_rebuild ;;
+            5) cmd_logs ;;
+            q|Q) echo "Bye."; exit 0 ;;
+            *) echo "  Unknown option." ;;
+        esac
+    done
+}
+
+# ── entry point ─────────────────────────────────────────────────────────────
+
+case "${1:-}" in
+    start)   cmd_start ;;
+    stop)    cmd_stop ;;
+    shell)   cmd_shell ;;
+    status)  cmd_status ;;
+    rebuild) cmd_rebuild ;;
+    logs)    cmd_logs ;;
+    "")      interactive_menu ;;
+    *)
+        echo "Usage: $0 [start|stop|shell|status|rebuild|logs]"
+        echo "       $0          (interactive menu)"
+        exit 1
+        ;;
+esac

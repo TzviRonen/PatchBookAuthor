@@ -1,0 +1,13 @@
+09:58:42 INFO     Running ghidriff:
+  ghidriff /workspace/data/binaries/CVE-2024-30088/ntoskrnl.exe.4474 /workspace/data/binaries/CVE-2024-30088/ntoskrnl.exe.4522 --output-path /workspace/data/diffs --project-location /tmp/ghidra_proj_45mrgh5v --project-name ghidriff_CVE-2024-30088 --symbols-path /workspace/data/symbols --log-level WARNING
+10:07:43 INFO     ghidriff finished: ntoskrnl.exe.4474-ntoskrnl.exe.4522.ghidriff.md (174 KB)
+
+Trace file: /workspace/data/run_trace.json
+Already completed stages: msrc, winbindex
+
+[STAGE 3: ghidriff]
+       Running ghidriff on ntoskrnl.exe.4474 vs ntoskrnl.exe.4522
+       This will take 20–40 minutes for ntoskrnl.exe ...
+[32m  ✓ PASS[0m  Diff generated: ntoskrnl.exe.4474-ntoskrnl.exe.4522.ghidriff.md  (174 KB)
+         Section headers found: 149
+[32m  ✓ PASS[0m  Ground truth function 'AuthzBasepCopyoutInternalSecurityAttributes' present in diff
