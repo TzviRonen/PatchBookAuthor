@@ -17,6 +17,7 @@ from pathlib import Path
 log = logging.getLogger(__name__)
 
 CONFIDENCE_THRESHOLD = 75
+FALLBACK_CONFIDENCE_THRESHOLD = 60   # accept best is_patch=True result if nothing hits 75
 NEGATIVE_CONFIDENCE_THRESHOLD = 90   # stop early if agent is this sure it's NOT the patch
 MAX_CONSECUTIVE_NEGATIVES = 2        # require N in a row before stopping, not just one
 MAX_CANDIDATES = 20
@@ -166,20 +167,24 @@ def _parse_fallback(text: str) -> list[FunctionSection]:
 # ---------------------------------------------------------------------------
 
 _BUG_CLASS_KEYWORDS = {
-    "toctou":        ["copy", "capture", "snap", "lock", "probe", "stack", "local"],
-    "race":          ["copy", "capture", "lock", "atomic", "sequence", "stack"],
-    "eop":           ["privilege", "token", "access", "check", "elevat", "restrict"],
-    "buffer":        ["size", "length", "alloc", "copy", "overflow", "bound", "limit"],
-    "uaf":           ["free", "ref", "count", "release", "dereference", "lifetime"],
-    "null":          ["null", "check", "valid", "deref", "ptr", "pointer"],
-    "info_leak":     ["leak", "copy", "write", "output", "disclose"],
+    "toctou":          ["copy", "capture", "snap", "lock", "probe", "stack", "local"],
+    "race":            ["copy", "capture", "lock", "atomic", "sequence", "stack"],
+    "eop":             ["privilege", "token", "access", "check", "elevat", "restrict"],
+    "buffer":          ["size", "length", "alloc", "copy", "overflow", "bound", "limit"],
+    "uaf":             ["free", "ref", "count", "release", "dereference", "lifetime"],
+    "null":            ["null", "check", "valid", "deref", "ptr", "pointer"],
+    "info_leak":       ["leak", "copy", "write", "output", "disclose"],
+    "buffer_over_read": ["read", "size", "length", "bound", "offset", "limit", "cap", "check", "query"],
 }
 
 _GENERIC_UTIL_PREFIXES = re.compile(r"^(Rtl|ExAllocate|ExFree|KeAcquire|KeRelease|Mm|Io|Zw)", re.I)
 _SECURITY_FIX_PATTERNS = re.compile(
     r"STATUS_ACCESS_DENIED|STATUS_INVALID|ProbeFor|AcquireLock|ReleaseLock"
     r"|ExAcquire|ExRelease|if \(.*== NULL\)|if \(!|RtlCopyMemory|SafeCopy"
-    r"|__try|ASSERT\(|STATUS_BUFFER|STATUS_INSUF",
+    r"|__try|ASSERT\(|STATUS_BUFFER|STATUS_INSUF"
+    # info-leak / buffer-over-read patterns
+    r"|RtlZeroMemory|memset\s*\(|SecureZeroMemory|RtlSecureZeroMemory"
+    r"|sizeof\s*\(|min\s*\(|_countof\s*\(",
     re.IGNORECASE,
 )
 _DEFENSIVE_NAME_PATTERNS = re.compile(r"Check|Validate|Verify|Guard|Probe|Sanitize", re.I)
@@ -213,7 +218,8 @@ def _extract_cve_keywords(cve: dict) -> list[str]:
                      "stack", "local", "cache", "clone"]
 
     if "information" in tl or "disclosure" in tl:
-        expanded += ["copy", "write", "read", "output", "return", "leak"]
+        expanded += ["copy", "write", "read", "output", "return", "leak",
+                     "query", "buffer", "size", "length", "bound", "zero", "memory"]
 
     if "remote code" in tl or "rce" in tl:
         expanded += ["parse", "process", "input", "buffer", "alloc", "recv"]
@@ -243,8 +249,10 @@ def _detect_bug_class(cve: dict) -> list[str]:
         return _BUG_CLASS_KEYWORDS["buffer"]
     if "null" in text:
         return _BUG_CLASS_KEYWORDS["null"]
+    if "buffer over-read" in text or "buffer overread" in text or "cwe-126" in text:
+        return _BUG_CLASS_KEYWORDS["buffer_over_read"]
     if "information" in text or "disclosure" in text:
-        return _BUG_CLASS_KEYWORDS["info_leak"]
+        return _BUG_CLASS_KEYWORDS["info_leak"] + _BUG_CLASS_KEYWORDS["buffer_over_read"]
     # default EoP (applies to "Elevation of Privilege" CVEs)
     return _BUG_CLASS_KEYWORDS["eop"]
 
@@ -359,6 +367,17 @@ loop/iteration over the local copy instead of the original pointer.
 **Use-after-free:**
 - The fix adds a reference count increment before use or a lock around the free path.
 - Look for: ObReferenceObject, ExInterlockedIncrement, new lock acquire before dereference.
+
+**Information Disclosure (Buffer Over-read / Missing Initialisation):**
+- Buffer over-read fix: adds an explicit bounds check before a read/copy, e.g. \
+`if (RequestedBytes > AvailableBytes) return STATUS_BUFFER_TOO_SMALL` or \
+`BytesToCopy = min(RequestedBytes, BufferSize)` before RtlCopyMemory.
+- Missing initialisation fix: adds RtlZeroMemory/memset to zero the output buffer \
+before populating it, preventing residual kernel data from leaking to user-mode.
+- Look for: new `if (size > max)` guard, a `min()` cap on a copy length, \
+added zero-fill of a stack or heap output buffer, new ProbeForWrite before write-back.
+- Do NOT flag large refactors that incidentally touch buffer-handling code — focus on \
+the small targeted change that closes the over-read or plugs the uninitialised leak.
 
 ## What a security fix looks like vs. a refactor
 
@@ -544,6 +563,7 @@ def identify_patch(cve: dict, diff_path: Path) -> PatchResult:
 
     agent_evals: list[AgentEval] = []
     consecutive_negatives = 0
+    best_positive: tuple[AgentEval, FunctionSection] | None = None  # tracks best is_patch=True below threshold
     cve_id = cve.get("id", "unknown")
 
     for i, scored_sec in enumerate(candidates):
@@ -565,19 +585,12 @@ def identify_patch(cve: dict, diff_path: Path) -> PatchResult:
         if eval_result.is_patch and eval_result.confidence >= CONFIDENCE_THRESHOLD:
             log.info("IDENTIFIED patch: %s (confidence=%d) after evaluating %d candidate(s)",
                      sec.name, eval_result.confidence, i + 1)
-            return PatchResult(
-                function_name=sec.name,
-                confidence=eval_result.confidence,
-                reasoning=eval_result.reasoning,
-                patch_type=eval_result.patch_type,
-                full_diff=sec.diff_text,
-                candidates_evaluated=i + 1,
-                heuristic_scores=heuristic_log,
-                agent_evals=[{"fn": e.fn_name, "is_patch": e.is_patch,
-                               "confidence": e.confidence, "reasoning": e.reasoning,
-                               "patch_type": e.patch_type}
-                              for e in agent_evals],
-            )
+            return _make_result(sec, eval_result, i + 1, heuristic_log, agent_evals)
+
+        # Track best positive below threshold for fallback
+        if eval_result.is_patch and eval_result.confidence >= FALLBACK_CONFIDENCE_THRESHOLD:
+            if best_positive is None or eval_result.confidence > best_positive[0].confidence:
+                best_positive = (eval_result, sec)
 
         if not eval_result.is_patch and eval_result.confidence >= NEGATIVE_CONFIDENCE_THRESHOLD:
             consecutive_negatives += 1
@@ -591,7 +604,33 @@ def identify_patch(cve: dict, diff_path: Path) -> PatchResult:
         else:
             consecutive_negatives = 0
 
+    # Fallback: return best is_patch=True result if it met the lower threshold
+    if best_positive is not None:
+        best_eval, best_sec = best_positive
+        log.info(
+            "IDENTIFIED patch (fallback, confidence=%d): %s — no candidate reached %d%%",
+            best_eval.confidence, best_sec.name, CONFIDENCE_THRESHOLD,
+        )
+        return _make_result(best_sec, best_eval, len(agent_evals), heuristic_log, agent_evals)
+
     raise PatchNotFoundError(
         f"No patch identified in top-{min(i + 1, len(candidates))} candidates for {cve.get('id')}. "
         f"Best confidence: {max((e.confidence for e in agent_evals), default=0)}"
+    )
+
+
+def _make_result(sec: FunctionSection, ev: AgentEval, n: int,
+                 heuristic_log: list, agent_evals: list) -> "PatchResult":
+    return PatchResult(
+        function_name=sec.name,
+        confidence=ev.confidence,
+        reasoning=ev.reasoning,
+        patch_type=ev.patch_type,
+        full_diff=sec.diff_text,
+        candidates_evaluated=n,
+        heuristic_scores=heuristic_log,
+        agent_evals=[{"fn": e.fn_name, "is_patch": e.is_patch,
+                      "confidence": e.confidence, "reasoning": e.reasoning,
+                      "patch_type": e.patch_type}
+                     for e in agent_evals],
     )

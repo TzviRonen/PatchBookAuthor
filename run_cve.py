@@ -139,7 +139,7 @@ def find_update_for_cve(cve_id: str) -> tuple[str, dict]:
 TOTAL_STEPS = 6
 
 
-def run(cve_id: str, update_id: str | None, data_dir: Path, force: bool) -> None:
+def run(cve_id: str, update_id: str | None, data_dir: Path, force: bool, skip_blog: bool = False) -> None:
     traces_dir = data_dir / "traces"
     trace = Trace(traces_dir / f"{cve_id}.json")
 
@@ -276,6 +276,16 @@ def run(cve_id: str, update_id: str | None, data_dir: Path, force: bool) -> None
             print(f"       WARNING: patch identification error: {e} — falling back to full diff")
 
     # ── Step 5: Generate blog post ─────────────────────────────────────────────
+    if skip_blog:
+        _print(5, TOTAL_STEPS, "Blog post skipped (--skip-blog)")
+        _print(6, TOTAL_STEPS, "Done")
+        print()
+        if patch_result:
+            print(f"  Patch fn  : {patch_result.function_name} ({patch_result.confidence}% confidence)")
+            print(f"  Reasoning : {patch_result.reasoning}")
+        print(f"  Diff      : {diff_path}")
+        return
+
     _print(5, TOTAL_STEPS, "Generating blog post...")
 
     cached = trace.get("blog")
@@ -336,6 +346,11 @@ def main() -> None:
         help="Ignore cached stage results and re-run everything.",
     )
     parser.add_argument(
+        "--skip-blog",
+        action="store_true",
+        help="Stop after the identify stage — skip blog post generation.",
+    )
+    parser.add_argument(
         "--from-stage",
         metavar="STAGE",
         choices=["msrc", "binaries", "ghidriff", "identify", "blog"],
@@ -357,7 +372,7 @@ def main() -> None:
             trace.clear(stage)
         print(f"  Cleared stages from '{args.from_stage}' onwards.\n")
 
-    run(cve_id, args.update_id, data_dir, force=args.force)
+    run(cve_id, args.update_id, data_dir, force=args.force, skip_blog=args.skip_blog)
 
 
 if __name__ == "__main__":
