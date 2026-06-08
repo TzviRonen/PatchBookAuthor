@@ -239,9 +239,12 @@ def run(cve_id: str, update_id: str | None, data_dir: Path, force: bool, skip_bl
     patch_result = None
     cached = trace.get("identify")
     if cached:
-        patch_result_dict = cached
+        co = cached.get("co_patches", []) or []
+        co_str = ""
+        if co:
+            co_str = " + " + ", ".join(f"{c['name']} ({c['confidence']}%)" for c in co)
         _print(4, TOTAL_STEPS, "Identify (cached)",
-               f"{cached['function_name']} (confidence={cached['confidence']}%)")
+               f"{cached['function_name']} ({cached['confidence']}%){co_str}")
         # Reconstruct a minimal object for blog generator
         from pipeline.patch_identifier import PatchResult
         patch_result = PatchResult(
@@ -253,13 +256,18 @@ def run(cve_id: str, update_id: str | None, data_dir: Path, force: bool, skip_bl
             candidates_evaluated=cached["candidates_evaluated"],
             heuristic_scores=[],
             agent_evals=[],
+            co_patches=co,
         )
     else:
         try:
             patch_result = identify_patch(cve, diff_path)
+            co = patch_result.co_patches or []
+            co_str = ""
+            if co:
+                co_str = " + " + ", ".join(f"{c['name']} ({c['confidence']}%)" for c in co)
             _print(4, TOTAL_STEPS, "Identify",
-                   f"{patch_result.function_name} (confidence={patch_result.confidence}%, "
-                   f"type={patch_result.patch_type})")
+                   f"{patch_result.function_name} ({patch_result.confidence}%, "
+                   f"type={patch_result.patch_type}){co_str}")
             trace.save("identify", {
                 "function_name": patch_result.function_name,
                 "confidence": patch_result.confidence,
@@ -269,6 +277,7 @@ def run(cve_id: str, update_id: str | None, data_dir: Path, force: bool, skip_bl
                 "candidates_evaluated": patch_result.candidates_evaluated,
                 "heuristic_scores": patch_result.heuristic_scores,
                 "agent_evals": patch_result.agent_evals,
+                "co_patches": patch_result.co_patches,
             })
         except PatchNotFoundError as e:
             print(f"       WARNING: {e} — falling back to full diff for blog")
@@ -283,6 +292,9 @@ def run(cve_id: str, update_id: str | None, data_dir: Path, force: bool, skip_bl
         if patch_result:
             print(f"  Patch fn  : {patch_result.function_name} ({patch_result.confidence}% confidence)")
             print(f"  Reasoning : {patch_result.reasoning}")
+            for co in (patch_result.co_patches or []):
+                print(f"  Co-patch  : {co['name']} ({co['confidence']}% confidence)")
+                print(f"  Reasoning : {co['reasoning']}")
         print(f"  Diff      : {diff_path}")
         return
 
@@ -314,6 +326,8 @@ def run(cve_id: str, update_id: str | None, data_dir: Path, force: bool, skip_bl
     print(f"  Diff      : {diff_path}")
     if patch_result:
         print(f"  Patch fn  : {patch_result.function_name} ({patch_result.confidence}% confidence)")
+        for co in (patch_result.co_patches or []):
+            print(f"  Co-patch  : {co['name']} ({co['confidence']}% confidence)")
 
 
 # ── entry point ────────────────────────────────────────────────────────────────

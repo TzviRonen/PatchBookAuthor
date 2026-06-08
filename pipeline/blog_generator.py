@@ -85,23 +85,53 @@ def generate_blog_post(
     Falls back to reading the full *diff_path* if no patch_result provided.
     """
     if patch_result is not None:
-        diff_content = patch_result.full_diff
+        co_patches = getattr(patch_result, "co_patches", []) or []
+
+        if co_patches:
+            # Split char budget: primary gets 60%, co-patches share 40%
+            n_co = len(co_patches)
+            primary_limit = int(DIFF_INPUT_CHAR_LIMIT * 0.60)
+            co_limit = max(1000, int(DIFF_INPUT_CHAR_LIMIT * 0.40) // n_co)
+        else:
+            primary_limit = DIFF_INPUT_CHAR_LIMIT
+            co_limit = 0
+
         patch_context = f"""\
-## Identified Patch Function
+## Primary Patch — `{patch_result.function_name}` ({patch_result.confidence}% confidence)
 
-**Function**: `{patch_result.function_name}`
 **Bug class**: {patch_result.patch_type}
-**Confidence**: {patch_result.confidence}%
-
-**Analysis notes**: {patch_result.reasoning}
-
----
-
-## Diff of patched function (`{patch_result.function_name}`)
+**Analysis**: {patch_result.reasoning}
 
 ```diff
-{diff_content[:DIFF_INPUT_CHAR_LIMIT]}
+{patch_result.full_diff[:primary_limit]}
 ```
+{"*(truncated)*" if len(patch_result.full_diff) > primary_limit else ""}
+"""
+        for co in co_patches:
+            co_diff = co.get("diff", "")
+            patch_context += f"""
+---
+
+## Co-patched Function — `{co['name']}` ({co['confidence']}% confidence)
+
+**Bug class**: {co.get('patch_type', 'other')}
+**Analysis**: {co['reasoning']}
+
+```diff
+{co_diff[:co_limit]}
+```
+{"*(truncated)*" if len(co_diff) > co_limit else ""}
+"""
+
+        if co_patches:
+            names = ", ".join(f"`{c['name']}`" for c in co_patches)
+            patch_context += f"""
+---
+
+*Note: `{patch_result.function_name}` is the primary patch. {names} \
+{"is" if n_co == 1 else "are"} co-patched — Microsoft applied the same fix consistently \
+across multiple related code paths. Describe all functions and how together they form a \
+complete, coherent security fix.*
 """
     elif diff_path is not None:
         raw_diff = diff_path.read_text(encoding="utf-8", errors="replace")

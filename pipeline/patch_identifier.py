@@ -21,6 +21,8 @@ FALLBACK_CONFIDENCE_THRESHOLD = 60   # accept best is_patch=True result if nothi
 NEGATIVE_CONFIDENCE_THRESHOLD = 90   # stop early if agent is this sure it's NOT the patch
 MAX_CONSECUTIVE_NEGATIVES = 2        # require N in a row before stopping, not just one
 MAX_CANDIDATES = 20
+CO_PATCH_CONFIDENCE_THRESHOLD = 50   # accept co-patch if agent is this sure it's related
+MAX_CO_PATCH_CANDIDATES = 6          # max related functions to evaluate
 
 # ---------------------------------------------------------------------------
 # Data types
@@ -61,6 +63,9 @@ class PatchResult:
     candidates_evaluated: int
     heuristic_scores: list[dict]
     agent_evals: list[dict]
+    co_patches: list[dict] = field(default_factory=list)
+    # co_patches entries: {"name": str, "confidence": int, "reasoning": str,
+    #                      "patch_type": str, "diff": str}
 
 
 class PatchNotFoundError(Exception):
@@ -268,6 +273,84 @@ def _extract_calling_names(diff_text: str) -> set[str]:
     return calling
 
 
+def _extract_called_names(diff_text: str) -> set[str]:
+    """Parse the ghidriff Function Meta Diff table to find functions called BY this one."""
+    called: set[str] = set()
+    for m in re.finditer(r"\|`?called`?\|\s*([^|]+)\|", diff_text):
+        for name in re.split(r"<br>|\s*,\s*|\s+", m.group(1)):
+            name = name.strip()
+            if name and re.match(r"[A-Za-z_]\w{3,}", name):
+                called.add(name)
+    return called
+
+
+def _extract_feature_flags(diff_text: str) -> set[str]:
+    """Return CFR feature IDs referenced in a function's diff (e.g. '2504257848')."""
+    return {m.group(1) for m in re.finditer(
+        r'Feature_(\d+)__private_IsEnabledDeviceUsage', diff_text
+    )}
+
+
+def _find_related_candidates(
+    primary_sec: FunctionSection,
+    all_sections: list[FunctionSection],
+) -> list[FunctionSection]:
+    """Find functions likely co-patched with the primary based on structural signals.
+
+    Signals evaluated in priority order:
+    1. Same CFR feature flag ID (strongest) — size gate up to 500 changed lines.
+    2. Shared changed callee — both call the same function that is itself in the diff.
+    3. Same 4-char name prefix (same subsystem, e.g. 'Whea') — size gate up to 300.
+    Results are returned in priority order so the strongest signals are evaluated first.
+    """
+    primary_flags = _extract_feature_flags(primary_sec.diff_text)
+    primary_prefix = primary_sec.name[:4].lower()
+    primary_callees = _extract_called_names(primary_sec.diff_text)
+
+    all_changed_names = {s.name for s in all_sections} - {primary_sec.name}
+
+    # 3 priority buckets; a function can only appear in one (first match wins)
+    flag_matches: list[FunctionSection] = []
+    callee_matches: list[FunctionSection] = []
+    prefix_matches: list[FunctionSection] = []
+    seen: set[str] = set()
+
+    for sec in all_sections:
+        if sec.name == primary_sec.name or sec.name in seen:
+            continue
+        change_size = sec.added_lines + sec.removed_lines
+        if change_size < 3:
+            continue
+
+        # Signal 1: shared CFR feature flag (relaxed upper size gate)
+        if primary_flags and change_size <= 500:
+            sec_flags = _extract_feature_flags(sec.diff_text)
+            if primary_flags & sec_flags:
+                flag_matches.append(sec)
+                seen.add(sec.name)
+                continue
+
+        if change_size > 300:
+            continue
+
+        # Signal 2: shared changed callee
+        if primary_callees:
+            sec_callees = _extract_called_names(sec.diff_text)
+            shared_callees = primary_callees & sec_callees & all_changed_names
+            if shared_callees:
+                callee_matches.append(sec)
+                seen.add(sec.name)
+                continue
+
+        # Signal 3: same 4-char subsystem prefix
+        if len(sec.name) >= 4 and sec.name[:4].lower() == primary_prefix:
+            prefix_matches.append(sec)
+            seen.add(sec.name)
+
+    related = flag_matches + callee_matches + prefix_matches
+    return related[:MAX_CO_PATCH_CANDIDATES]
+
+
 def rank_by_heuristics(sections: list[FunctionSection], cve: dict) -> list[ScoredSection]:
     cve_keywords = _extract_cve_keywords(cve)
     bug_keywords = _detect_bug_class(cve)
@@ -406,7 +489,36 @@ that is not itself called by another changed candidate.
 
 You MUST end your response with a JSON block on its own line:
 ```json
-{"is_patch": <true|false>, "confidence": <0-100>, "reasoning": "<one concise sentence>", "patch_type": "<TOCTOU|EoP|buffer_overflow|use_after_free|null_deref|other>"}
+{"is_patch": <true|false>, "confidence": <0-100>, "reasoning": "<one concise sentence>", "patch_type": "<TOCTOU|EoP|buffer_overflow|use_after_free|null_deref|info_leak|other>"}
+```
+"""
+
+
+_RELATED_SYSTEM = """\
+You are a Windows kernel security researcher analyzing binary patch diffs.
+
+A primary patch function for a CVE has already been identified. Your task is to determine \
+whether a SECOND changed function is also part of the same CVE fix — i.e., Microsoft applied \
+the same defensive change consistently across multiple related code paths.
+
+## What to look for
+
+A function IS a co-patch if it shows the SAME fix pattern as the primary:
+- Same CFR feature flag controlling the same type of defense (zero-init, bounds check, etc.)
+- Same zero-initialization of output buffers before a logging/serialization call
+- Same bounds cap added before a copy or read operation
+- Consistent application of the fix pattern to the same subsystem (e.g. Add/Remove/Init paths)
+
+A function is NOT a co-patch if:
+- It was changed for unrelated reasons (recompilation artifacts, variable renames, refactoring)
+- It touches a completely different subsystem with no logical connection to the primary fix
+- The diff shows no security-relevant change (only address shifts, register shuffles)
+
+## Output format
+
+End your response with a JSON block:
+```json
+{"is_patch": <true|false>, "confidence": <0-100>, "reasoning": "<one concise sentence>", "patch_type": "<TOCTOU|EoP|buffer_overflow|use_after_free|null_deref|info_leak|other>"}
 ```
 """
 
@@ -529,12 +641,155 @@ Is this the security patch for {cve['id']}? End your response with the JSON verd
     )
 
 
+def _rel_cache_path(cve_id: str, fn_name: str, primary_name: str, diff_text: str) -> Path:
+    from pipeline.config import DATA_DIR
+    diff_hash = hashlib.sha256(diff_text.encode()).hexdigest()[:12]
+    safe_fn = re.sub(r"[^A-Za-z0-9_]", "_", fn_name)
+    safe_primary = re.sub(r"[^A-Za-z0-9_]", "_", primary_name)
+    return DATA_DIR / "cache" / "agent_evals" / cve_id / f"{safe_fn}__rel_{safe_primary}_{diff_hash}.json"
+
+
+def _call_agent_related(
+    cve: dict,
+    rel_sec: FunctionSection,
+    sections_by_name: dict[str, FunctionSection],
+    primary_sec: FunctionSection,
+    primary_eval: AgentEval,
+) -> AgentEval:
+    """Evaluate whether rel_sec is co-patched with the already-identified primary_sec."""
+    cve_id = cve.get("id", "unknown")
+
+    # Cache check
+    cache_path = _rel_cache_path(cve_id, rel_sec.name, primary_sec.name, rel_sec.diff_text)
+    if cache_path.exists():
+        try:
+            log.info("  (co-patch cache hit: %s)", rel_sec.name)
+            return AgentEval(**json.loads(cache_path.read_text(encoding="utf-8")))
+        except Exception:
+            pass
+
+    primary_flags = _extract_feature_flags(primary_sec.diff_text)
+    rel_flags = _extract_feature_flags(rel_sec.diff_text)
+    shared_flags = primary_flags & rel_flags
+    flag_note = (f"Shared CFR feature flags: {', '.join(sorted(shared_flags))}."
+                 if shared_flags else "No shared CFR feature flags detected.")
+
+    # Caller/callee context (same as _call_agent)
+    callers = [
+        s.name for s in sections_by_name.values()
+        if rel_sec.name in s.diff_text and s.name != rel_sec.name
+    ]
+    callees = [
+        s.name for s in sections_by_name.values()
+        if s.name in rel_sec.diff_text and s.name != rel_sec.name
+    ]
+    caller_block = ""
+    if callers:
+        caller_block = f"\n**Other changed functions that call this one**: {', '.join(callers[:8])}\n"
+    if callees:
+        caller_block += f"**Changed functions this one calls**: {', '.join(callees[:8])}\n"
+
+    cve_desc = cve.get("description", "(no description)")
+    if len(cve_desc) > 800:
+        cve_desc = cve_desc[:800] + "..."
+
+    user_msg = f"""\
+## CVE Information
+- **CVE ID**: {cve['id']}
+- **Title**: {cve.get('title', '')}
+- **Description**: {cve_desc}
+
+## Primary patch already identified
+- **Function**: `{primary_sec.name}`
+- **Reasoning**: {primary_eval.reasoning}
+- **Bug class**: {primary_eval.patch_type}
+
+## Candidate co-patch function: `{rel_sec.name}`
+Lines added: {rel_sec.added_lines}  |  Lines removed: {rel_sec.removed_lines}
+{flag_note}{caller_block}
+```diff
+{rel_sec.diff_text[:6000]}
+```
+{"*(truncated)*" if len(rel_sec.diff_text) > 6000 else ""}
+
+Is `{rel_sec.name}` also part of the same CVE fix as `{primary_sec.name}`? End with the JSON verdict.
+"""
+
+    response_text = _call_claude_cli(_RELATED_SYSTEM, user_msg)
+
+    json_m = re.search(r"```json\s*(\{.*?\})\s*```", response_text, re.DOTALL)
+    if not json_m:
+        json_m = re.search(r"\{[^{}]*\"is_patch\"[^{}]*\}", response_text, re.DOTALL)
+
+    if json_m:
+        try:
+            raw = json_m.group(1) if "```" in json_m.group(0) else json_m.group(0)
+            verdict = json.loads(raw)
+            result = AgentEval(
+                fn_name=rel_sec.name,
+                is_patch=bool(verdict.get("is_patch", False)),
+                confidence=int(verdict.get("confidence", 0)),
+                reasoning=str(verdict.get("reasoning", "")),
+                patch_type=str(verdict.get("patch_type", "other")),
+            )
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            cache_path.write_text(json.dumps({
+                "fn_name": result.fn_name, "is_patch": result.is_patch,
+                "confidence": result.confidence, "reasoning": result.reasoning,
+                "patch_type": result.patch_type,
+            }), encoding="utf-8")
+            return result
+        except Exception as e:
+            log.warning("Failed to parse co-patch agent JSON for %s: %s", rel_sec.name, e)
+
+    return AgentEval(fn_name=rel_sec.name, is_patch=False, confidence=0,
+                     reasoning="No structured verdict returned", patch_type="other")
+
+
 # ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
 
+def _find_co_patches(
+    primary_sec: FunctionSection,
+    primary_eval: AgentEval,
+    all_sections: list[FunctionSection],
+    sections_by_name: dict[str, FunctionSection],
+    cve: dict,
+) -> list[dict]:
+    """Identify functions co-patched alongside the primary patch."""
+    related = _find_related_candidates(primary_sec, all_sections)
+    if not related:
+        return []
+
+    log.info("Checking %d related candidate(s) for co-patches alongside %s:",
+             len(related), primary_sec.name)
+
+    co_patches: list[dict] = []
+    for rel_sec in related:
+        log.info("  Co-patch candidate: %s (+%d/-%d)",
+                 rel_sec.name, rel_sec.added_lines, rel_sec.removed_lines)
+        rel_eval = _call_agent_related(cve, rel_sec, sections_by_name, primary_sec, primary_eval)
+        log.info("  → is_patch=%s confidence=%d — %s",
+                 rel_eval.is_patch, rel_eval.confidence, rel_eval.reasoning[:100])
+        if rel_eval.is_patch and rel_eval.confidence >= CO_PATCH_CONFIDENCE_THRESHOLD:
+            co_patches.append({
+                "name": rel_sec.name,
+                "confidence": rel_eval.confidence,
+                "reasoning": rel_eval.reasoning,
+                "patch_type": rel_eval.patch_type,
+                "diff": rel_sec.diff_text,
+            })
+            log.info("  CO-PATCH confirmed: %s (confidence=%d)", rel_sec.name, rel_eval.confidence)
+
+    return co_patches
+
+
 def identify_patch(cve: dict, diff_path: Path) -> PatchResult:
-    """Identify the patched function in a ghidriff diff for a given CVE.
+    """Identify the patched function(s) in a ghidriff diff for a given CVE.
+
+    After finding the primary patch, automatically checks for co-patched functions
+    that received the same fix in the same build.
 
     Raises PatchNotFoundError if no candidate reaches CONFIDENCE_THRESHOLD.
     """
@@ -563,7 +818,7 @@ def identify_patch(cve: dict, diff_path: Path) -> PatchResult:
 
     agent_evals: list[AgentEval] = []
     consecutive_negatives = 0
-    best_positive: tuple[AgentEval, FunctionSection] | None = None  # tracks best is_patch=True below threshold
+    best_positive: tuple[AgentEval, FunctionSection] | None = None
     cve_id = cve.get("id", "unknown")
 
     for i, scored_sec in enumerate(candidates):
@@ -585,7 +840,8 @@ def identify_patch(cve: dict, diff_path: Path) -> PatchResult:
         if eval_result.is_patch and eval_result.confidence >= CONFIDENCE_THRESHOLD:
             log.info("IDENTIFIED patch: %s (confidence=%d) after evaluating %d candidate(s)",
                      sec.name, eval_result.confidence, i + 1)
-            return _make_result(sec, eval_result, i + 1, heuristic_log, agent_evals)
+            co_patches = _find_co_patches(sec, eval_result, sections, sections_by_name, cve)
+            return _make_result(sec, eval_result, i + 1, heuristic_log, agent_evals, co_patches)
 
         # Track best positive below threshold for fallback
         if eval_result.is_patch and eval_result.confidence >= FALLBACK_CONFIDENCE_THRESHOLD:
@@ -611,7 +867,9 @@ def identify_patch(cve: dict, diff_path: Path) -> PatchResult:
             "IDENTIFIED patch (fallback, confidence=%d): %s — no candidate reached %d%%",
             best_eval.confidence, best_sec.name, CONFIDENCE_THRESHOLD,
         )
-        return _make_result(best_sec, best_eval, len(agent_evals), heuristic_log, agent_evals)
+        co_patches = _find_co_patches(best_sec, best_eval, sections, sections_by_name, cve)
+        return _make_result(best_sec, best_eval, len(agent_evals), heuristic_log, agent_evals,
+                            co_patches)
 
     raise PatchNotFoundError(
         f"No patch identified in top-{min(i + 1, len(candidates))} candidates for {cve.get('id')}. "
@@ -620,7 +878,8 @@ def identify_patch(cve: dict, diff_path: Path) -> PatchResult:
 
 
 def _make_result(sec: FunctionSection, ev: AgentEval, n: int,
-                 heuristic_log: list, agent_evals: list) -> "PatchResult":
+                 heuristic_log: list, agent_evals: list,
+                 co_patches: list[dict] | None = None) -> "PatchResult":
     return PatchResult(
         function_name=sec.name,
         confidence=ev.confidence,
@@ -633,4 +892,5 @@ def _make_result(sec: FunctionSection, ev: AgentEval, n: int,
                       "confidence": e.confidence, "reasoning": e.reasoning,
                       "patch_type": e.patch_type}
                      for e in agent_evals],
+        co_patches=co_patches or [],
     )
