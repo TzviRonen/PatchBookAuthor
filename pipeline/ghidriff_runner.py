@@ -5,12 +5,12 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-from pipeline.config import GHIDRA_INSTALL_DIR, GHIDRIFF_TIMEOUT
+from pipeline.config import GHIDRA_INSTALL_DIR, GHIDRIFF_TIMEOUT, DATA_DIR
 
 log = logging.getLogger(__name__)
 
 # Symbol cache shared across runs to avoid re-downloading PDBs
-_SYMBOLS_DIR = Path(os.getenv("DATA_DIR", "/data")) / "symbols"
+_SYMBOLS_DIR = DATA_DIR / "symbols"
 
 
 def run_ghidriff(old_binary: Path, new_binary: Path, output_dir: Path, name: str) -> Path:
@@ -38,8 +38,11 @@ def run_ghidriff(old_binary: Path, new_binary: Path, output_dir: Path, name: str
             "JAVA_HOME": os.getenv("JAVA_HOME", "/usr/lib/jvm/java-21-openjdk-amd64"),
         }
 
+        # Prefer the venv binary so it's found even when venv isn't on PATH
+        _venv_bin = Path(os.path.dirname(os.sys.executable)) / "ghidriff"
+        ghidriff_bin = str(_venv_bin) if _venv_bin.exists() else "ghidriff"
         cmd = [
-            "ghidriff",
+            ghidriff_bin,
             str(old_binary),
             str(new_binary),
             "--output-path", str(output_dir),

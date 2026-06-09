@@ -65,8 +65,11 @@ def fetch_cvrf(update_id: str, force: bool = False) -> dict:
 
     log.info("Fetching CVRF for update %s", update_id)
     data = _get(f"/cvrf/{update_id}")
-    cache_path.parent.mkdir(parents=True, exist_ok=True)
-    cache_path.write_text(json.dumps(data), encoding="utf-8")
+    try:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_text(json.dumps(data), encoding="utf-8")
+    except Exception as e:
+        log.warning("Could not cache CVRF for %s: %s", update_id, e)
     return data
 
 

@@ -92,29 +92,31 @@ def _cve_year(cve_id: str) -> int:
     return int(cve_id.split("-")[1])
 
 
+def _update_id_year(update: dict) -> int | None:
+    """Extract the year from the update ID (e.g. '2026-Apr' → 2026)."""
+    uid = update.get("ID") or update.get("Alias", "")
+    m = re.match(r"^(\d{4})-", uid)
+    return int(m.group(1)) if m else None
+
+
 def find_update_for_cve(cve_id: str) -> tuple[str, dict]:
     """Search MSRC monthly updates to find the one containing cve_id.
 
     Returns (update_id, cve_dict) e.g. ("2024-Jun", {...}).
-    Searches the CVE year first, then the following year.
+    Searches year-1 through year+1 (most recent first) to handle CVEs
+    disclosed in one year but patched in an adjacent year.
     """
     year = _cve_year(cve_id)
-    since = datetime(year, 1, 1) - timedelta(days=1)
-    until = datetime(year + 1, 12, 31)
-
-    updates = list_updates(since=since)
-    # Most recent first — the fix usually ships close to the disclosure date
-    updates_sorted = sorted(
-        updates,
-        key=lambda u: u.get("CurrentReleaseDate", ""),
-        reverse=True,
-    )
-    # Filter to the CVE year and following year
+    # Fetch all updates without a date filter — we filter by ID year below
+    # (CurrentReleaseDate is unreliable: MSRC bumps it on every revision)
+    all_updates = list_updates()
+    search_years = {year - 1, year, year + 1}
     updates_sorted = [
-        u for u in updates_sorted
-        if str(year) in u.get("CurrentReleaseDate", "")
-        or str(year + 1) in u.get("CurrentReleaseDate", "")
+        u for u in all_updates
+        if _update_id_year(u) in search_years
     ]
+    # Most recent first so we find the fix quickly
+    updates_sorted.sort(key=lambda u: u.get("ID", ""), reverse=True)
 
     searched: list[str] = []
     for update in updates_sorted:
@@ -123,7 +125,8 @@ def find_update_for_cve(cve_id: str) -> tuple[str, dict]:
             continue
         try:
             cvrf = fetch_cvrf(uid)
-        except Exception:
+        except Exception as e:
+            log.warning("Could not fetch %s: %s", uid, e)
             continue
         searched.append(uid)
         for cve in iter_cves(cvrf):

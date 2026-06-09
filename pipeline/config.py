@@ -1,7 +1,7 @@
 import os
 from pathlib import Path
 
-DATA_DIR = Path(os.getenv("DATA_DIR", "/data"))
+DATA_DIR = Path(os.getenv("DATA_DIR", str(Path(__file__).parent.parent / "data")))
 BINARIES_DIR = DATA_DIR / "binaries"
 DIFFS_DIR = DATA_DIR / "diffs"
 BLOGS_DIR = DATA_DIR / "blogs"
