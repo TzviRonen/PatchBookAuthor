@@ -1,0 +1,75 @@
+{% extends "base.html" %}
+{% block title %}Blog Posts{% endblock %}
+{% block body %}
+<div class="page" style="max-width:860px;">
+  <div class="page-header">
+    <h1>Blog Posts</h1>
+    <p>AI-generated deep-dives into Windows kernel CVE patches.</p>
+  </div>
+
+  {% if not items %}
+  <div class="card">
+    <div class="empty-state">
+      <div class="empty-icon">📭</div>
+      <p>No blog posts yet. <a href="/tasks/new" style="color:var(--blue)">Run a pipeline task</a> to generate one.</p>
+    </div>
+  </div>
+  {% else %}
+  <div style="display:flex;flex-direction:column;gap:1.25rem;">
+    {% for item in items %}
+    <a href="/cve/{{ item.cve_id }}/blog?from=blogs" style="text-decoration:none;color:inherit;">
+    <div class="card" style="transition:box-shadow 0.15s,border-color 0.15s;cursor:pointer;"
+         onmouseover="this.style.borderColor='#0969da';this.style.boxShadow='0 4px 16px rgba(9,105,218,0.10)'"
+         onmouseout="this.style.borderColor='#d0d7de';this.style.boxShadow='0 1px 3px rgba(31,35,40,0.08)'">
+      <div class="card-body" style="padding:1.6rem 1.75rem;">
+
+        <!-- top row: cve id + cvss badge -->
+        <div style="display:flex;align-items:center;gap:0.75rem;margin-bottom:0.6rem;flex-wrap:wrap;">
+          <span style="font-family:var(--font-mono);font-size:0.85rem;font-weight:700;
+                       color:var(--blue);background:var(--blue-bg);border:1px solid var(--blue-border);
+                       border-radius:4px;padding:2px 8px;">{{ item.cve_id }}</span>
+          {% if item.cvss %}
+            {% if item.cvss >= 9 %}
+              <span class="badge red">CVSS {{ item.cvss }}</span>
+            {% elif item.cvss >= 7 %}
+              <span class="badge orange">CVSS {{ item.cvss }}</span>
+            {% elif item.cvss >= 4 %}
+              <span class="badge yellow">CVSS {{ item.cvss }}</span>
+            {% else %}
+              <span class="badge muted">CVSS {{ item.cvss }}</span>
+            {% endif %}
+          {% endif %}
+          <span style="margin-left:auto;font-size:0.82rem;color:var(--muted);">{{ item.size }}</span>
+        </div>
+
+        <!-- title -->
+        <h2 style="font-size:1.2rem;font-weight:700;color:var(--text);line-height:1.35;margin-bottom:0.3rem;">
+          {{ item.title }}
+        </h2>
+
+        <!-- subtitle / first section -->
+        {% if item.subtitle %}
+        <div style="font-size:0.9rem;font-weight:600;color:var(--blue);margin-bottom:0.6rem;">
+          {{ item.subtitle }}
+        </div>
+        {% endif %}
+
+        <!-- excerpt -->
+        {% if item.excerpt %}
+        <p style="font-size:0.92rem;color:var(--muted);line-height:1.65;margin:0 0 1rem;">
+          {{ item.excerpt }}
+        </p>
+        {% endif %}
+
+        <!-- read link -->
+        <div style="font-size:0.88rem;color:var(--blue);font-weight:600;">
+          Read full post →
+        </div>
+      </div>
+    </div>
+    </a>
+    {% endfor %}
+  </div>
+  {% endif %}
+</div>
+{% endblock %}

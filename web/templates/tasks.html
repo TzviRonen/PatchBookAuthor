@@ -1,0 +1,47 @@
+{% extends "base.html" %}
+{% block title %}Tasks{% endblock %}
+{% block body %}
+<div class="page">
+  <div class="page-header flex-between">
+    <div>
+      <h1>Tasks</h1>
+      <p>Pipeline runs in this session.</p>
+    </div>
+    <a href="/tasks/new" class="btn btn-solid">+ New Task</a>
+  </div>
+
+  {% if not tasks %}
+  <div class="card">
+    <div class="empty-state">
+      <div class="empty-icon">📋</div>
+      <p>No tasks run yet. <a href="/tasks/new" style="color:var(--blue)">Start one</a>.</p>
+    </div>
+  </div>
+  {% else %}
+  <div class="card">
+    <table>
+      <thead>
+        <tr><th>Task ID</th><th>CVE</th><th>Status</th><th>Started</th><th>Actions</th></tr>
+      </thead>
+      <tbody>
+        {% for t in tasks %}
+        <tr>
+          <td class="mono small"><a href="/tasks/{{ t.id }}">{{ t.id }}</a></td>
+          <td><a href="/cve/{{ t.cve_id }}">{{ t.cve_id }}</a></td>
+          <td>
+            <span class="status-dot {{ t.status }}"></span>
+            <span class="small">{{ t.status }}</span>
+          </td>
+          <td class="mono small muted">{{ t.started_at[:19].replace('T',' ') }} UTC</td>
+          <td style="display:flex;gap:0.4rem;flex-wrap:wrap;">
+            <a href="/tasks/{{ t.id }}" class="btn btn-blue" style="font-size:0.82rem;padding:0.3rem 0.75rem;">Logs</a>
+            <a href="/tasks/new?cve={{ t.cve_id }}" class="btn btn-muted" style="font-size:0.82rem;padding:0.3rem 0.75rem;">Re-run</a>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% endif %}
+</div>
+{% endblock %}

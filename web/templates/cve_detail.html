@@ -1,0 +1,223 @@
+{% extends "base.html" %}
+{% block title %}{{ cve_id }}{% endblock %}
+{% block body %}
+<div class="page">
+  <div class="page-header">
+    <div class="flex-gap" style="margin-bottom:0.5rem;">
+      <a href="/" style="color:var(--muted);text-decoration:none;font-size:0.9rem;">Dashboard</a>
+      <span style="color:var(--border)">›</span>
+      <span style="font-family:var(--font-mono);color:var(--text);font-weight:600;">{{ cve_id }}</span>
+    </div>
+    <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:1rem;flex-wrap:wrap;">
+      <div>
+        <h1 style="font-family:var(--font-mono);">{{ cve_id }}</h1>
+        {% if stages.msrc and stages.msrc.result %}
+        <p>{{ stages.msrc.result.cve.title }}</p>
+        {% endif %}
+      </div>
+      <div style="display:flex;gap:0.6rem;flex-wrap:wrap;">
+        {% if blog_path %}
+        <a href="/cve/{{ cve_id }}/blog" class="btn btn-blue">📝 Blog Post</a>
+        {% endif %}
+        {% if diff_path %}
+        <a href="/cve/{{ cve_id }}/diff" class="btn btn-orange">⬡ Ghidriff</a>
+        {% endif %}
+        <a href="/tasks/new?cve={{ cve_id }}" class="btn btn-muted">↻ Re-run</a>
+      </div>
+    </div>
+  </div>
+
+  <!-- CVE metadata -->
+  {% if stages.msrc and stages.msrc.result %}
+  {% set meta = stages.msrc.result.cve %}
+  <div class="card">
+    <div class="card-header"><h3>CVE Metadata</h3></div>
+    <div class="card-body">
+      <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:1.5rem;">
+        {% if meta.cvss %}
+        <div>
+          <div class="small muted" style="margin-bottom:0.3rem;">CVSS Score</div>
+          <div style="font-size:2rem;font-weight:700;font-family:var(--font-mono);
+            {% if meta.cvss >= 9 %}color:var(--red){% elif meta.cvss >= 7 %}color:var(--orange){% else %}color:var(--yellow){% endif %}">
+            {{ meta.cvss }}
+          </div>
+        </div>
+        {% endif %}
+        {% if stages.msrc.result.update_id %}
+        <div>
+          <div class="small muted" style="margin-bottom:0.3rem;">MSRC Update</div>
+          <div class="mono" style="font-size:1.1rem;font-weight:600;">{{ stages.msrc.result.update_id }}</div>
+        </div>
+        {% endif %}
+        {% if meta.kb_numbers %}
+        <div>
+          <div class="small muted" style="margin-bottom:0.3rem;">KB Numbers</div>
+          <div style="display:flex;flex-wrap:wrap;gap:0.35rem;margin-top:0.2rem;">
+            {% for kb in meta.kb_numbers %}
+            <span class="badge muted mono">{{ kb }}</span>
+            {% endfor %}
+          </div>
+        </div>
+        {% endif %}
+        {% if meta.description %}
+        <div style="grid-column:1/-1;">
+          <div class="small muted" style="margin-bottom:0.3rem;">Description</div>
+          <div style="font-size:0.95rem;line-height:1.6;">{{ meta.description }}</div>
+        </div>
+        {% endif %}
+      </div>
+    </div>
+  </div>
+  {% endif %}
+
+  <!-- Stage timeline -->
+  <div class="card mt2">
+    <div class="card-header"><h3>Pipeline Stages</h3></div>
+    <div style="padding:0;">
+      {% for stage in stage_list %}
+      {% set s = stages.get(stage, {}) %}
+      {% set is_done = s.get('status') == 'done' %}
+      <div style="display:flex;align-items:flex-start;gap:1.25rem;padding:1.1rem 1.4rem;border-bottom:1px solid var(--border-soft);{% if loop.last %}border-bottom:none{% endif %}">
+        <div style="width:32px;height:32px;border-radius:50%;display:flex;align-items:center;justify-content:center;flex-shrink:0;margin-top:0.1rem;font-size:0.9rem;font-weight:700;
+          {% if is_done %}background:var(--green-bg);border:2px solid var(--green-border);color:var(--green)
+          {% else %}background:var(--bg2);border:2px solid var(--border);color:var(--muted2){% endif %}">
+          {% if is_done %}✓{% else %}{{ loop.index }}{% endif %}
+        </div>
+        <div style="flex:1;min-width:0;">
+          <div style="display:flex;align-items:center;gap:0.75rem;flex-wrap:wrap;">
+            <span style="font-weight:600;font-size:0.95rem;">{{ stage_labels[stage] }}</span>
+            {% if is_done %}
+            <span class="badge green" style="font-size:0.75rem;">done</span>
+            {% if s.completed_at %}
+            <span class="small muted mono">{{ s.completed_at[:19].replace('T',' ') }} UTC</span>
+            {% endif %}
+            {% else %}
+            <span class="badge muted" style="font-size:0.75rem;">pending</span>
+            {% endif %}
+          </div>
+          {% if is_done and s.result %}
+          <div style="margin-top:0.5rem;font-size:0.9rem;color:var(--muted);">
+            {% if stage == 'msrc' %}
+              Update: <span class="mono" style="color:var(--text);font-weight:600;">{{ s.result.update_id }}</span>
+            {% elif stage == 'binaries' %}
+              pre=<span class="mono" style="color:var(--text);font-weight:600;">{{ s.result.pre_build }}</span>
+              &nbsp;→&nbsp;post=<span class="mono" style="color:var(--text);font-weight:600;">{{ s.result.post_build }}</span>
+            {% elif stage == 'ghidriff' %}
+              <span class="mono" style="color:var(--text);font-weight:600;">{{ s.result.function_count }}</span> changed functions
+              &nbsp;·&nbsp;<span class="mono" style="color:var(--blue);">{{ s.result.diff_path.split('/')[-1] if s.result.diff_path else '' }}</span>
+            {% elif stage == 'identify' %}
+              <span class="mono" style="color:var(--orange);font-size:1rem;font-weight:700;">{{ s.result.function_name }}</span>
+              &nbsp;·&nbsp;
+              <span style="color:var(--text);font-weight:600;">{{ s.result.confidence }}% confidence</span>
+              &nbsp;·&nbsp;
+              <span class="badge orange" style="font-size:0.75rem;">{{ s.result.patch_type }}</span>
+              {% if s.result.candidates_evaluated %}
+              &nbsp;·&nbsp;{{ s.result.candidates_evaluated }} candidates evaluated
+              {% endif %}
+              {% if s.result.reasoning %}
+              <div style="margin-top:0.5rem;color:var(--text);font-style:italic;line-height:1.6;background:var(--bg2);padding:0.75rem 1rem;border-radius:6px;border-left:3px solid var(--blue-border);">
+                {{ s.result.reasoning }}
+              </div>
+              {% endif %}
+            {% elif stage == 'blog' %}
+              <a href="/cve/{{ cve_id }}/blog" style="color:var(--blue);">{{ s.result.blog_path.split('/')[-1] if s.result.blog_path else 'view' }}</a>
+            {% endif %}
+          </div>
+          {% endif %}
+        </div>
+      </div>
+      {% endfor %}
+    </div>
+  </div>
+
+  <!-- Patch identification detail -->
+  {% if stages.identify and stages.identify.result %}
+  {% set id_res = stages.identify.result %}
+  <div class="card mt2">
+    <div class="card-header"><h3>Patch Identification Detail</h3></div>
+    <div class="card-body">
+      <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:1.5rem;margin-bottom:1.25rem;">
+        <div>
+          <div class="small muted" style="margin-bottom:0.3rem;">Primary Function</div>
+          <div class="mono" style="color:var(--orange);font-size:1.15rem;font-weight:700;">{{ id_res.function_name }}</div>
+        </div>
+        <div>
+          <div class="small muted" style="margin-bottom:0.3rem;">Confidence</div>
+          <div style="font-size:2rem;font-weight:700;font-family:var(--font-mono);
+            {% if id_res.confidence >= 80 %}color:var(--green){% elif id_res.confidence >= 50 %}color:var(--orange){% else %}color:var(--red){% endif %}">
+            {{ id_res.confidence }}%
+          </div>
+        </div>
+        <div>
+          <div class="small muted" style="margin-bottom:0.3rem;">Patch Type</div>
+          <div class="mono" style="font-size:1rem;font-weight:600;margin-top:0.2rem;">{{ id_res.patch_type }}</div>
+        </div>
+        {% if id_res.candidates_evaluated %}
+        <div>
+          <div class="small muted" style="margin-bottom:0.3rem;">Candidates Evaluated</div>
+          <div class="mono" style="font-size:1rem;font-weight:600;margin-top:0.2rem;">{{ id_res.candidates_evaluated }}</div>
+        </div>
+        {% endif %}
+      </div>
+
+      {% if id_res.co_patches %}
+      <div style="margin-bottom:1.25rem;">
+        <div class="small muted" style="margin-bottom:0.6rem;font-weight:600;">Co-patches</div>
+        {% for co in id_res.co_patches %}
+        <div style="background:var(--purple-bg);border:1px solid #d8b9ff;border-radius:6px;padding:0.75rem 1rem;margin-bottom:0.5rem;">
+          <span class="mono" style="color:var(--purple);font-weight:700;">{{ co.name }}</span>
+          <span style="color:var(--muted);font-size:0.85rem;margin-left:0.75rem;">{{ co.confidence }}% confidence</span>
+          {% if co.reasoning %}
+          <div style="color:var(--muted);font-size:0.88rem;margin-top:0.4rem;font-style:italic;">{{ co.reasoning }}</div>
+          {% endif %}
+        </div>
+        {% endfor %}
+      </div>
+      {% endif %}
+
+      {% if id_res.heuristic_scores %}
+      <details>
+        <summary style="cursor:pointer;color:var(--blue);font-size:0.9rem;font-weight:600;margin-bottom:0.6rem;list-style:none;">
+          ▸ Heuristic Scores ({{ id_res.heuristic_scores|length }})
+        </summary>
+        <div style="margin-top:0.75rem;overflow-x:auto;">
+          <table>
+            <thead><tr><th>Function</th><th>Score</th><th>Signals</th></tr></thead>
+            <tbody>
+              {% for hs in id_res.heuristic_scores|sort(attribute='score', reverse=True) %}
+              <tr>
+                <td class="mono" style="color:{% if hs.name == id_res.function_name %}var(--orange){% else %}var(--text){% endif %};font-weight:{% if hs.name == id_res.function_name %}700{% else %}400{% endif %}">{{ hs.name }}</td>
+                <td class="mono">{{ hs.score }}</td>
+                <td class="small muted">{{ hs.signals|join(', ') if hs.signals else '—' }}</td>
+              </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      </details>
+      {% endif %}
+    </div>
+  </div>
+  {% endif %}
+
+  <!-- Binary info -->
+  {% if stages.binaries and stages.binaries.result %}
+  {% set bin = stages.binaries.result %}
+  <div class="card mt2">
+    <div class="card-header"><h3>Binaries</h3></div>
+    <div class="card-body">
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:1.5rem;">
+        <div>
+          <div class="small muted" style="margin-bottom:0.3rem;">Pre-patch (build {{ bin.pre_build }})</div>
+          <div class="mono small" style="color:var(--text);word-break:break-all;background:var(--bg2);padding:0.5rem 0.75rem;border-radius:6px;border:1px solid var(--border);">{{ bin.pre_path }}</div>
+        </div>
+        <div>
+          <div class="small muted" style="margin-bottom:0.3rem;">Post-patch (build {{ bin.post_build }})</div>
+          <div class="mono small" style="color:var(--text);word-break:break-all;background:var(--bg2);padding:0.5rem 0.75rem;border-radius:6px;border:1px solid var(--border);">{{ bin.post_path }}</div>
+        </div>
+      </div>
+    </div>
+  </div>
+  {% endif %}
+</div>
+{% endblock %}

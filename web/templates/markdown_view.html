@@ -1,0 +1,66 @@
+{% extends "base.html" %}
+{% block title %}{{ title }}{% endblock %}
+{% block head %}
+<style>
+.diff-toolbar { display:flex; align-items:center; gap:0.5rem; }
+/* diff line coloring inside pre blocks */
+.prose pre code .line-add { color: #3fb950; }
+.prose pre code .line-del { color: #f85149; }
+</style>
+{% endblock %}
+{% block body %}
+<div class="page">
+  <div class="page-header flex-between" style="flex-wrap:wrap;gap:0.75rem;">
+    <div>
+      {% if back_url %}
+      <div style="margin-bottom:0.4rem;">
+        <a href="{{ back_url }}" style="color:var(--muted);text-decoration:none;font-size:0.9rem;">&#x2190; {{ back_label if back_label else 'Back' }}</a>
+      </div>
+      {% endif %}
+      <h1 style="font-size:1.1rem;font-family:var(--font-mono);">{{ title }}</h1>
+    </div>
+    <div class="diff-toolbar">
+      <button onclick="toggleView()" id="view-toggle" class="btn btn-muted" style="font-size:0.78rem;">Raw</button>
+    </div>
+  </div>
+
+  <div id="rendered-view" class="card">
+    <div class="card-body">
+      <div class="prose">
+        {{ content_html | safe }}
+      </div>
+    </div>
+  </div>
+
+  <div id="raw-view" class="card" style="display:none;">
+    <div class="card-body" style="padding:0;">
+      <div class="terminal" style="max-height:80vh;border:none;border-radius:0;">{{ raw }}</div>
+    </div>
+  </div>
+</div>
+{% endblock %}
+{% block scripts %}
+<script>
+let isRaw = false;
+function toggleView() {
+  isRaw = !isRaw;
+  document.getElementById('rendered-view').style.display = isRaw ? 'none' : '';
+  document.getElementById('raw-view').style.display = isRaw ? '' : 'none';
+  document.getElementById('view-toggle').textContent = isRaw ? 'Rendered' : 'Raw';
+}
+
+// Colorize diff lines inside code blocks
+document.querySelectorAll('.prose pre code').forEach(block => {
+  const lines = block.innerHTML.split('\n');
+  block.innerHTML = lines.map(line => {
+    if (line.startsWith('+') && !line.startsWith('+++'))
+      return `<span style="color:var(--green)">${line}</span>`;
+    if (line.startsWith('-') && !line.startsWith('---'))
+      return `<span style="color:var(--red)">${line}</span>`;
+    if (line.startsWith('@@'))
+      return `<span style="color:var(--blue)">${line}</span>`;
+    return line;
+  }).join('\n');
+});
+</script>
+{% endblock %}

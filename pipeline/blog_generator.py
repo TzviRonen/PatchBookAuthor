@@ -163,6 +163,7 @@ complete, coherent security fix.*
 
     log.info("→ claude -p  blog post for %s (input=%d chars, timeout=600s)",
              cve["id"], len(user_message))
+    print(f"  → claude [blog:{cve['id']}]  ({len(user_message)} chars, timeout=600s) ...", flush=True)
     result = subprocess.run(
         ["claude", "-p", "--system-prompt", _SYSTEM_PROMPT],
         input=user_message,
@@ -170,6 +171,8 @@ complete, coherent security fix.*
         text=True,
         timeout=600,
     )
+    print(f"  ← claude [blog:{cve['id']}]  returned {len(result.stdout)} chars  (exit {result.returncode})",
+          flush=True)
     log.info("← claude -p  blog returned %d chars (exit %d)", len(result.stdout), result.returncode)
     if result.returncode != 0:
         raise RuntimeError(

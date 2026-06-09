@@ -50,24 +50,39 @@ def run_ghidriff(old_binary: Path, new_binary: Path, output_dir: Path, name: str
         ]
 
         log.info("Running ghidriff:\n  %s", " ".join(cmd))
+        print(f"  [ghidriff] starting — this takes 20-40 min", flush=True)
         try:
-            result = subprocess.run(
+            proc = subprocess.Popen(
                 cmd,
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
                 text=True,
-                timeout=GHIDRIFF_TIMEOUT,
                 env=env,
+                bufsize=1,
             )
+            output_lines: list[str] = []
+            for line in proc.stdout:
+                stripped = line.rstrip("\n")
+                output_lines.append(stripped)
+                print(f"  [ghidriff] {stripped}", flush=True)
+            try:
+                proc.wait(timeout=GHIDRIFF_TIMEOUT)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                raise RuntimeError(
+                    f"ghidriff timed out after {GHIDRIFF_TIMEOUT}s for {old_binary.name}"
+                )
         except subprocess.TimeoutExpired:
             raise RuntimeError(
                 f"ghidriff timed out after {GHIDRIFF_TIMEOUT}s for {old_binary.name}"
             )
 
-        if result.returncode != 0:
-            log.error("ghidriff stderr (last 6000 chars):\n%s", result.stderr[-6000:])
+        if proc.returncode != 0:
+            tail = "\n".join(output_lines[-100:])
+            log.error("ghidriff output (last 100 lines):\n%s", tail)
             raise RuntimeError(
-                f"ghidriff exited {result.returncode} for {old_binary.name}: "
-                f"{result.stderr[-500:]}"
+                f"ghidriff exited {proc.returncode} for {old_binary.name}: "
+                f"{chr(10).join(output_lines[-5:])}"
             )
 
     # Find output file — ghidriff names it based on binary filenames

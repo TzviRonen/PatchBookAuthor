@@ -552,9 +552,12 @@ def _save_eval_cache(cve_id: str, fn_name: str, diff_text: str, result: "AgentEv
     }), encoding="utf-8")
 
 
-def _call_claude_cli(system_prompt: str, user_message: str, timeout: int = 300) -> str:
+def _call_claude_cli(system_prompt: str, user_message: str, timeout: int = 300,
+                     label: str = "") -> str:
     """Call `claude -p` via subprocess and return stdout."""
-    log.info("→ claude -p  (input=%d chars, timeout=%ds)", len(user_message), timeout)
+    tag = f" [{label}]" if label else ""
+    print(f"  → claude{tag}  ({len(user_message)} chars, timeout={timeout}s) ...", flush=True)
+    log.info("→ claude -p%s (input=%d chars, timeout=%ds)", tag, len(user_message), timeout)
     result = subprocess.run(
         ["claude", "-p", "--system-prompt", system_prompt],
         input=user_message,
@@ -562,7 +565,9 @@ def _call_claude_cli(system_prompt: str, user_message: str, timeout: int = 300) 
         text=True,
         timeout=timeout,
     )
-    log.info("← claude -p  returned %d chars (exit %d)", len(result.stdout), result.returncode)
+    print(f"  ← claude{tag}  returned {len(result.stdout)} chars  (exit {result.returncode})",
+          flush=True)
+    log.info("← claude -p%s returned %d chars (exit %d)", tag, len(result.stdout), result.returncode)
     if result.returncode != 0:
         raise RuntimeError(
             f"claude CLI exited {result.returncode}: {result.stderr[:500]}"
@@ -611,7 +616,7 @@ Lines added: {section.added_lines}  |  Lines removed: {section.removed_lines}
 Is this the security patch for {cve['id']}? End your response with the JSON verdict block.
 """
 
-    response_text = _call_claude_cli(_AGENT_SYSTEM, user_msg)
+    response_text = _call_claude_cli(_AGENT_SYSTEM, user_msg, label=section.name)
 
     json_m = re.search(r"```json\s*(\{.*?\})\s*```", response_text, re.DOTALL)
     if not json_m:
@@ -621,13 +626,17 @@ Is this the security patch for {cve['id']}? End your response with the JSON verd
         try:
             raw = json_m.group(1) if "```" in json_m.group(0) else json_m.group(0)
             verdict = json.loads(raw)
-            return AgentEval(
+            result = AgentEval(
                 fn_name=section.name,
                 is_patch=bool(verdict.get("is_patch", False)),
                 confidence=int(verdict.get("confidence", 0)),
                 reasoning=str(verdict.get("reasoning", "")),
                 patch_type=str(verdict.get("patch_type", "other")),
             )
+            mark = "✓ PATCH" if result.is_patch else "✗ not patch"
+            print(f"  {'  '}[{section.name}] {mark}  confidence={result.confidence}%  — {result.reasoning[:100]}",
+                  flush=True)
+            return result
         except Exception as e:
             log.warning("Failed to parse agent JSON for %s: %s | text: %s",
                         section.name, e, response_text[-300:])
@@ -717,7 +726,7 @@ Lines added: {rel_sec.added_lines}  |  Lines removed: {rel_sec.removed_lines}
 Is `{rel_sec.name}` also part of the same CVE fix as `{primary_sec.name}`? End with the JSON verdict.
 """
 
-    response_text = _call_claude_cli(_RELATED_SYSTEM, user_msg)
+    response_text = _call_claude_cli(_RELATED_SYSTEM, user_msg, label=f"co-patch:{rel_sec.name}")
 
     json_m = re.search(r"```json\s*(\{.*?\})\s*```", response_text, re.DOTALL)
     if not json_m:
@@ -766,11 +775,15 @@ def _find_co_patches(
 
     log.info("Checking %d related candidate(s) for co-patches alongside %s:",
              len(related), primary_sec.name)
+    print(f"  [co-patch] checking {len(related)} related function(s) alongside {primary_sec.name}",
+          flush=True)
 
     co_patches: list[dict] = []
     for rel_sec in related:
         log.info("  Co-patch candidate: %s (+%d/-%d)",
                  rel_sec.name, rel_sec.added_lines, rel_sec.removed_lines)
+        print(f"  [co-patch] candidate: {rel_sec.name}  (+{rel_sec.added_lines}/-{rel_sec.removed_lines})",
+              flush=True)
         rel_eval = _call_agent_related(cve, rel_sec, sections_by_name, primary_sec, primary_eval)
         log.info("  → is_patch=%s confidence=%d — %s",
                  rel_eval.is_patch, rel_eval.confidence, rel_eval.reasoning[:100])
@@ -811,12 +824,18 @@ def identify_patch(cve: dict, diff_path: Path) -> PatchResult:
         for i, s in enumerate(candidates)
     ]
 
+    total_candidates = len(candidates)
+    print(f"  [identify] {len(sections)} changed functions — top {total_candidates} candidates to evaluate",
+          flush=True)
     log.info("Heuristic top-5 (of %d sections):", len(sections))
     for entry in heuristic_log[:5]:
         log.info("  %d. %-55s  score=%.0f  (+%d/-%d)  %s",
                  entry["rank"], entry["name"], entry["score"],
                  entry["added"], entry["removed"],
                  ", ".join(entry["reasons"][:4]))
+        print(f"  [heuristic] #{entry['rank']:2d}  {entry['name']:<55}  score={entry['score']:.0f}"
+              f"  (+{entry['added']}/-{entry['removed']})  {', '.join(entry['reasons'][:4])}",
+              flush=True)
 
     agent_evals: list[AgentEval] = []
     consecutive_negatives = 0
@@ -826,10 +845,15 @@ def identify_patch(cve: dict, diff_path: Path) -> PatchResult:
     for i, scored_sec in enumerate(candidates):
         sec = scored_sec.section
         log.info("Evaluating candidate #%d: %s", i + 1, sec.name)
+        print(f"  [evaluate] #{i+1}/{total_candidates}  {sec.name}  "
+              f"(+{sec.added_lines}/-{sec.removed_lines} lines, score={scored_sec.score:.0f})",
+              flush=True)
 
         cached = _load_eval_cache(cve_id, sec.name, sec.diff_text)
         if cached:
             log.info("  (cache hit)")
+            print(f"  [cache hit] {sec.name}  is_patch={cached.is_patch}  confidence={cached.confidence}%",
+                  flush=True)
             eval_result = cached
         else:
             eval_result = _call_agent(cve, sec, sections_by_name)

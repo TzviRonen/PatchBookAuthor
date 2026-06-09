@@ -1,0 +1,34 @@
+{% extends "base.html" %}
+{% block title %}Diffs{% endblock %}
+{% block body %}
+<div class="page">
+  <div class="page-header">
+    <h1>Ghidriff Diffs</h1>
+    <p>Binary diff output from Ghidriff.</p>
+  </div>
+
+  {% if not items %}
+  <div class="card">
+    <div class="empty-state">
+      <div class="empty-icon">⬡</div>
+      <p>No diffs found yet.</p>
+    </div>
+  </div>
+  {% else %}
+  <div class="card">
+    <table>
+      <thead><tr><th>File</th><th>Size</th><th></th></tr></thead>
+      <tbody>
+        {% for item in items %}
+        <tr>
+          <td class="mono">{{ item.name }}</td>
+          <td class="muted small">{{ item.size }}</td>
+          <td><a href="/diffs/{{ item.name }}" class="btn btn-orange" style="font-size:0.82rem;padding:0.3rem 0.75rem;">View</a></td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% endif %}
+</div>
+{% endblock %}

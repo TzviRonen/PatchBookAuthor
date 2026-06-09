@@ -116,6 +116,7 @@ def find_update_for_cve(cve_id: str) -> tuple[str, dict]:
         or str(year + 1) in u.get("CurrentReleaseDate", "")
     ]
 
+    searched: list[str] = []
     for update in updates_sorted:
         uid = update.get("ID") or update.get("Alias", "")
         if not uid:
@@ -124,13 +125,20 @@ def find_update_for_cve(cve_id: str) -> tuple[str, dict]:
             cvrf = fetch_cvrf(uid)
         except Exception:
             continue
+        searched.append(uid)
         for cve in iter_cves(cvrf):
             if cve["id"].upper() == cve_id.upper():
                 return uid, cve
 
+    searched_str = ", ".join(searched) if searched else "(none)"
     _fail(
-        f"{cve_id} not found in any {year}/{year+1} MSRC update.\n"
-        f"  Try specifying the update month with --update-id (e.g. --update-id 2024-Jun)."
+        f"{cve_id} not found in any MSRC update.\n"
+        f"  Searched {len(searched)} update(s): {searched_str}\n\n"
+        f"  Possible reasons:\n"
+        f"  • The CVE ID is incorrect or doesn't exist in MSRC yet.\n"
+        f"  • The fix ships in a different month — try --update-id (e.g. --update-id 2026-Jun).\n"
+        f"  • Patch Tuesday for this month hasn't happened yet — the CVRF may be incomplete.\n"
+        f"  • This CVE may be tracked under a different product (not ntoskrnl)."
     )
 
 

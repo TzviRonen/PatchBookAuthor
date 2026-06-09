@@ -1,0 +1,180 @@
+{% extends "base.html" %}
+{% block title %}New Task{% endblock %}
+{% block body %}
+<div class="page" style="max-width:860px;">
+  <div class="page-header">
+    <h1>+ New CVE Task</h1>
+    <p>Run the kernel CVE pipeline for a single CVE ID.</p>
+  </div>
+
+  <div class="card">
+    <div class="card-header"><h3>Task Parameters</h3></div>
+    <div class="card-body">
+      <form id="task-form">
+        <div class="form-row">
+          <label for="cve_id">CVE ID <span style="color:var(--red)">*</span></label>
+          <input type="text" id="cve_id" name="cve_id" placeholder="CVE-2024-30088"
+                 style="width:100%;max-width:360px;"
+                 value="{{ request.args.get('cve', '') }}">
+        </div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:1.25rem;max-width:700px;">
+          <div class="form-row" style="margin-bottom:0;">
+            <label for="update_id">MSRC Update ID <span class="muted">(optional)</span></label>
+            <input type="text" id="update_id" name="update_id" placeholder="2024-Jun" style="width:100%;">
+          </div>
+          <div class="form-row" style="margin-bottom:0;">
+            <label>From Stage <span class="muted">(re-run from)</span></label>
+            <select id="from_stage" name="from_stage" style="width:100%;">
+              <option value="">— full run —</option>
+              <option value="msrc">MSRC Lookup</option>
+              <option value="binaries">Binaries</option>
+              <option value="ghidriff">Ghidriff</option>
+              <option value="identify">Patch Identify</option>
+              <option value="blog">Blog Post</option>
+            </select>
+          </div>
+        </div>
+        <div style="display:flex;gap:2rem;flex-wrap:wrap;margin:1.25rem 0 1.5rem;">
+          <div class="form-check">
+            <input type="checkbox" id="force" name="force" value="1">
+            <label for="force">Force re-run all stages</label>
+          </div>
+          <div class="form-check">
+            <input type="checkbox" id="skip_blog" name="skip_blog" value="1">
+            <label for="skip_blog">Skip blog generation</label>
+          </div>
+        </div>
+        <div style="display:flex;gap:0.75rem;align-items:center;">
+          <button type="submit" class="btn btn-solid" id="run-btn">▶ Run Pipeline</button>
+          <span id="run-error" style="color:var(--red);font-size:0.9rem;display:none;"></span>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- live terminal -->
+  <div id="terminal-card" class="card mt2" style="display:none;">
+    <div class="card-header">
+      <h3>
+        <span class="status-dot" id="status-dot"></span>
+        <span id="terminal-title">Running…</span>
+      </h3>
+      <div style="display:flex;gap:0.6rem;align-items:center;">
+        <span id="elapsed" class="small muted mono"></span>
+        <button onclick="killTask()" id="kill-btn" class="btn btn-red" style="font-size:0.82rem;padding:0.35rem 0.75rem;">Kill</button>
+        <a id="cve-link" href="#" class="btn btn-blue" style="font-size:0.82rem;padding:0.35rem 0.75rem;display:none;">View CVE →</a>
+      </div>
+    </div>
+    <div style="padding:0;">
+      <div id="terminal" class="terminal" style="min-height:320px;max-height:60vh;border:none;border-radius:0 0 8px 8px;overflow-y:auto;"></div>
+    </div>
+  </div>
+</div>
+{% endblock %}
+{% block scripts %}
+<script>
+let taskId = null;
+let startTime = null;
+let timerInterval = null;
+let evtSource = null;
+
+const form     = document.getElementById('task-form');
+const termCard = document.getElementById('terminal-card');
+const termEl   = document.getElementById('terminal');
+const statusDot= document.getElementById('status-dot');
+const titleEl  = document.getElementById('terminal-title');
+const killBtn  = document.getElementById('kill-btn');
+const runBtn   = document.getElementById('run-btn');
+const elapsedEl= document.getElementById('elapsed');
+const cveLinkEl= document.getElementById('cve-link');
+const runError = document.getElementById('run-error');
+
+const STEP_RE = /^\[\d+\/\d+\]/;
+const ERR_RE  = /\bERROR\b|\bFAIL(ED)?\b/i;
+const WARN_RE = /\bWARN(ING)?\b/i;
+const INFO_RE = /\bINFO\b/;
+
+function colorLine(line) {
+  const esc = line.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  if (STEP_RE.test(line)) return `<span style="color:#3fb950;font-weight:600">${esc}</span>`;
+  if (ERR_RE.test(line))  return `<span style="color:#f85149">${esc}</span>`;
+  if (WARN_RE.test(line)) return `<span style="color:#e3b341">${esc}</span>`;
+  if (INFO_RE.test(line)) return `<span style="color:#79c0ff">${esc}</span>`;
+  return esc;
+}
+
+function appendLine(line) {
+  termEl.innerHTML += colorLine(line) + '\n';
+  termEl.scrollTop = termEl.scrollHeight;
+}
+
+function updateElapsed() {
+  if (!startTime) return;
+  const s = Math.floor((Date.now() - startTime) / 1000);
+  const m = Math.floor(s / 60), sec = s % 60;
+  elapsedEl.textContent = `${m}:${sec.toString().padStart(2,'0')}`;
+}
+
+form.addEventListener('submit', async e => {
+  e.preventDefault();
+  const cveId = document.getElementById('cve_id').value.trim();
+  if (!cveId) { showError('CVE ID is required'); return; }
+  runError.style.display = 'none';
+  runBtn.disabled = true;
+  runBtn.textContent = '… Starting';
+
+  const body = new URLSearchParams({
+    cve_id:     cveId,
+    update_id:  document.getElementById('update_id').value,
+    from_stage: document.getElementById('from_stage').value,
+    force:      document.getElementById('force').checked ? '1' : '',
+    skip_blog:  document.getElementById('skip_blog').checked ? '1' : '',
+  });
+
+  const res = await fetch('/tasks/run', { method:'POST', body });
+  const data = await res.json();
+  if (data.error) { showError(data.error); runBtn.disabled=false; runBtn.textContent='▶ Run Pipeline'; return; }
+
+  taskId = data.task_id;
+  startTime = Date.now();
+  timerInterval = setInterval(updateElapsed, 1000);
+
+  termCard.style.display = '';
+  termEl.innerHTML = '';
+  titleEl.textContent = `${cveId}  ·  task ${taskId}`;
+  statusDot.className = 'status-dot running';
+  killBtn.style.display = '';
+  cveLinkEl.href = `/cve/${cveId}`;
+  cveLinkEl.style.display = '';
+
+  evtSource = new EventSource(`/tasks/${taskId}/stream`);
+  evtSource.onmessage = e => appendLine(e.data);
+  evtSource.addEventListener('done', e => {
+    evtSource.close();
+    clearInterval(timerInterval);
+    const ok = e.data === 'exit=0';
+    statusDot.className = `status-dot ${ok ? 'done' : 'failed'}`;
+    titleEl.textContent = `${cveId}  ·  ${ok ? 'DONE ✓' : 'FAILED ✗'}  (${e.data})`;
+    killBtn.style.display = 'none';
+    runBtn.disabled = false;
+    runBtn.textContent = '▶ Run Pipeline';
+    appendLine('');
+    appendLine(ok ? '✓  Pipeline completed successfully.' : '✗  Pipeline exited with an error.');
+  });
+  evtSource.onerror = () => { appendLine('[connection closed]'); clearInterval(timerInterval); };
+});
+
+function showError(msg) { runError.textContent = msg; runError.style.display = ''; }
+
+async function killTask() {
+  if (!taskId || !confirm('Kill the running task?')) return;
+  await fetch(`/tasks/${taskId}/kill`, { method:'POST' });
+  if (evtSource) evtSource.close();
+  clearInterval(timerInterval);
+  statusDot.className = 'status-dot killed';
+  titleEl.textContent += ' — KILLED';
+  killBtn.style.display = 'none';
+  appendLine('[task killed]');
+}
+</script>
+{% endblock %}

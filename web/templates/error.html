@@ -1,0 +1,10 @@
+{% extends "base.html" %}
+{% block title %}Error{% endblock %}
+{% block body %}
+<div class="page" style="max-width:640px;text-align:center;padding-top:5rem;">
+  <div style="font-size:3rem;margin-bottom:1rem;">⚠️</div>
+  <h1 style="margin-bottom:0.75rem;">Something went wrong</h1>
+  <p style="color:var(--muted);margin-bottom:2rem;font-size:1rem;">{{ msg }}</p>
+  <a href="/" class="btn btn-muted">← Back to Dashboard</a>
+</div>
+{% endblock %}

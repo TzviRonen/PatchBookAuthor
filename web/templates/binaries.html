@@ -1,0 +1,41 @@
+{% extends "base.html" %}
+{% block title %}Binaries{% endblock %}
+{% block body %}
+<div class="page">
+  <div class="page-header">
+    <h1>Binaries</h1>
+    <p>Downloaded kernel binaries organized by CVE.</p>
+  </div>
+
+  {% if not groups %}
+  <div class="card">
+    <div class="empty-state">
+      <div class="empty-icon">📦</div>
+      <p>No binaries downloaded yet.</p>
+    </div>
+  </div>
+  {% else %}
+  {% for cve_id, files in groups.items() %}
+  <div class="card mt2">
+    <div class="card-header">
+      <h3>
+        <a href="/cve/{{ cve_id }}" style="color:var(--blue);text-decoration:none;font-family:var(--font-mono);">{{ cve_id }}</a>
+      </h3>
+      <span class="small muted">{{ files|length }} file{% if files|length != 1 %}s{% endif %}</span>
+    </div>
+    <table>
+      <thead><tr><th>Filename</th><th>Size</th></tr></thead>
+      <tbody>
+        {% for f in files %}
+        <tr>
+          <td class="mono">{{ f.name }}</td>
+          <td class="muted small">{{ f.size }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% endfor %}
+  {% endif %}
+</div>
+{% endblock %}

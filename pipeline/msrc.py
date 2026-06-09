@@ -43,16 +43,25 @@ def _parse_date(s: str) -> datetime:
         return datetime.min
 
 
-def fetch_cvrf(update_id: str) -> dict:
+_CVRF_CACHE_MAX_AGE_DAYS = 45  # re-fetch if cached copy is newer than this
+
+
+def fetch_cvrf(update_id: str, force: bool = False) -> dict:
     """Fetch the full CVRF document for a given update ID (e.g. '2024-Jan').
 
-    Caches to DATA_DIR/fixtures/cvrf/{update_id}.json — MSRC monthly documents
-    are immutable once published so the cache never expires.
+    Caches to DATA_DIR/fixtures/cvrf/{update_id}.json.
+    MSRC documents are immutable once Patch Tuesday has passed, but may gain
+    new CVEs in the days before it.  Files cached less than
+    _CVRF_CACHE_MAX_AGE_DAYS ago are re-fetched to pick up any additions.
     """
+    import time
     cache_path = DATA_DIR / "fixtures" / "cvrf" / f"{update_id}.json"
-    if cache_path.exists():
-        log.debug("Loading CVRF for %s from cache", update_id)
-        return json.loads(cache_path.read_text(encoding="utf-8"))
+    if not force and cache_path.exists():
+        age_days = (time.time() - cache_path.stat().st_mtime) / 86_400
+        if age_days >= _CVRF_CACHE_MAX_AGE_DAYS:
+            log.debug("Loading CVRF for %s from cache (age=%.0fd)", update_id, age_days)
+            return json.loads(cache_path.read_text(encoding="utf-8"))
+        log.info("CVRF cache for %s is %.0f days old — re-fetching", update_id, age_days)
 
     log.info("Fetching CVRF for update %s", update_id)
     data = _get(f"/cvrf/{update_id}")

@@ -1,0 +1,70 @@
+{% extends "base.html" %}
+{% block title %}Logs{% endblock %}
+{% block body %}
+<div class="page">
+  <div class="page-header">
+    <h1>Logs</h1>
+    <p>Pipeline log files and run traces.</p>
+  </div>
+
+  <div id="log-tabs">
+    <div class="tabs">
+      <button class="tab-btn active" data-tab="tab-ghidriff">ghidriff.log</button>
+      <button class="tab-btn" data-tab="tab-run-trace">run_trace.json</button>
+      <button class="tab-btn" data-tab="tab-ghidriff-run">ghidriff_run.log</button>
+    </div>
+
+    <div id="tab-ghidriff" class="tab-panel active">
+      {% if log_text %}
+      <div class="terminal" style="max-height:75vh;" id="ghidriff-log">{{ log_text }}</div>
+      {% else %}
+      <div style="color:var(--muted);padding:1.5rem;">No ghidriff.log found.</div>
+      {% endif %}
+    </div>
+
+    <div id="tab-run-trace" class="tab-panel">
+      {% if run_trace_text %}
+      <div class="terminal" style="max-height:75vh;" id="run-trace-log">{{ run_trace_text }}</div>
+      {% else %}
+      <div style="color:var(--muted);padding:1.5rem;">No run_trace.json found.</div>
+      {% endif %}
+    </div>
+
+    <div id="tab-ghidriff-run" class="tab-panel">
+      {% if ghidriff_run_log %}
+      <div class="terminal" style="max-height:75vh;" id="ghidriff-run-log">{{ ghidriff_run_log }}</div>
+      {% else %}
+      <div style="color:var(--muted);padding:1.5rem;">No ghidriff_run.log found.</div>
+      {% endif %}
+    </div>
+  </div>
+</div>
+{% endblock %}
+{% block scripts %}
+<script>
+tabs('log-tabs');
+function colorLog(el) {
+  if (!el) return;
+  const lines = el.textContent.split('\n');
+  el.innerHTML = lines.map(line => {
+    const esc = line.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    if (/\bERROR\b|\bFAILED\b/i.test(line)) return `<span style="color:#f85149">${esc}</span>`;
+    if (/\bWARN(ING)?\b/i.test(line))       return `<span style="color:#e3b341">${esc}</span>`;
+    if (/\bINFO\b/.test(line))              return `<span style="color:#79c0ff">${esc}</span>`;
+    if (/\bDEBUG\b/.test(line))             return `<span style="color:#484f58">${esc}</span>`;
+    return esc;
+  }).join('\n');
+}
+colorLog(document.getElementById('ghidriff-log'));
+colorLog(document.getElementById('ghidriff-run-log'));
+const traceEl = document.getElementById('run-trace-log');
+if (traceEl) {
+  try { traceEl.textContent = JSON.stringify(JSON.parse(traceEl.textContent), null, 2); }
+  catch(e) {}
+}
+['ghidriff-log','run-trace-log','ghidriff-run-log'].forEach(id => {
+  const el = document.getElementById(id);
+  if (el) el.scrollTop = el.scrollHeight;
+});
+</script>
+{% endblock %}
