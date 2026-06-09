@@ -552,8 +552,9 @@ def _save_eval_cache(cve_id: str, fn_name: str, diff_text: str, result: "AgentEv
     }), encoding="utf-8")
 
 
-def _call_claude_cli(system_prompt: str, user_message: str, timeout: int = 180) -> str:
+def _call_claude_cli(system_prompt: str, user_message: str, timeout: int = 300) -> str:
     """Call `claude -p` via subprocess and return stdout."""
+    log.info("→ claude -p  (input=%d chars, timeout=%ds)", len(user_message), timeout)
     result = subprocess.run(
         ["claude", "-p", "--system-prompt", system_prompt],
         input=user_message,
@@ -561,6 +562,7 @@ def _call_claude_cli(system_prompt: str, user_message: str, timeout: int = 180) 
         text=True,
         timeout=timeout,
     )
+    log.info("← claude -p  returned %d chars (exit %d)", len(result.stdout), result.returncode)
     if result.returncode != 0:
         raise RuntimeError(
             f"claude CLI exited {result.returncode}: {result.stderr[:500]}"

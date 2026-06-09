@@ -161,7 +161,8 @@ complete, coherent security fix.*
 {patch_context}
 """
 
-    log.info("Calling Claude CLI to generate blog post for %s", cve["id"])
+    log.info("→ claude -p  blog post for %s (input=%d chars, timeout=600s)",
+             cve["id"], len(user_message))
     result = subprocess.run(
         ["claude", "-p", "--system-prompt", _SYSTEM_PROMPT],
         input=user_message,
@@ -169,6 +170,7 @@ complete, coherent security fix.*
         text=True,
         timeout=600,
     )
+    log.info("← claude -p  blog returned %d chars (exit %d)", len(result.stdout), result.returncode)
     if result.returncode != 0:
         raise RuntimeError(
             f"claude CLI exited {result.returncode}: {result.stderr[:500]}"

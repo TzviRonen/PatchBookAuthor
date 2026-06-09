@@ -30,7 +30,7 @@ from pipeline.blog_generator import generate_blog_post, save_blog_post
 # ── logging ────────────────────────────────────────────────────────────────────
 
 logging.basicConfig(
-    level=logging.WARNING,          # suppress pipeline internals
+    level=logging.INFO,
     format="%(levelname)-8s %(name)s: %(message)s",
 )
 log = logging.getLogger("run_cve")

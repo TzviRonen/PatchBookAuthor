@@ -42,6 +42,21 @@ docker compose --profile once run --rm run-once
 docker compose up -d pipeline
 ```
 
+## Single-CVE runner (development)
+
+`run_cve.py` runs the full pipeline for one CVE and is the primary tool for development and investigation:
+
+```bash
+python3 run_cve.py CVE-2024-30088
+python3 run_cve.py CVE-2024-30088 --skip-blog        # stop after patch identification
+python3 run_cve.py CVE-2024-30088 --force             # ignore all cached stages
+python3 run_cve.py CVE-2024-30088 --from-stage blog   # re-run from a specific stage
+python3 run_cve.py CVE-2024-30088 --update-id 2024-Jun  # skip MSRC search
+python3 run_cve.py https://msrc.microsoft.com/update-guide/vulnerability/CVE-2024-30088
+```
+
+Each stage result is cached in `data/traces/<CVE-ID>.json` so the pipeline can resume from any completed stage after a crash or forced re-run.
+
 Output is written to `./data/`:
 
 | Path | Contents |
@@ -49,7 +64,9 @@ Output is written to `./data/`:
 | `data/binaries/<CVE-ID>/` | Downloaded PE files |
 | `data/diffs/` | ghidriff markdown reports |
 | `data/blogs/` | Generated blog posts |
-| `data/db/pipeline.db` | SQLite state (processed CVEs) |
+| `data/traces/<CVE-ID>.json` | Per-CVE stage cache (crash recovery) |
+| `data/cache/agent_evals/` | Cached Claude agent evaluations per function |
+| `data/db/pipeline.db` | SQLite state (processed CVEs, daemon mode) |
 
 ## Running outside Docker (development)
 
@@ -99,9 +116,11 @@ All settings are environment variables with sensible defaults:
 
 **Patch identification** works in two phases:
 1. Heuristic scoring ranks all changed functions by CVE keyword overlap, change size, and security patterns — no LLM calls.
-2. A Claude agent evaluates the top candidates one at a time, stopping at the first function with ≥75% confidence. It uses tool calls to fetch caller context on demand.
+2. A Claude agent evaluates the top candidates one at a time (300s timeout per call), stopping at the first function with ≥75% confidence. It uses tool calls to fetch caller context on demand. After a primary patch is found, remaining high-scoring candidates are evaluated for co-patches (functions changed as part of the same fix).
 
-**Blog generation** sends only the identified function's diff (not the full noisy report) to Claude, producing a focused technical writeup.
+Agent evaluation results are cached per-function in `data/cache/agent_evals/` so re-runs don't re-evaluate already-seen functions.
+
+**Blog generation** sends only the identified function's diff (not the full noisy report) to Claude, producing a focused technical writeup. If co-patches were found, they are included in the blog context.
 
 ## Project layout
 
@@ -116,6 +135,7 @@ pipeline/
   database.py         — SQLite state tracking
   config.py           — environment-based configuration
   main.py             — orchestrator + CLI entry point
+run_cve.py            — single-CVE runner (development entry point)
 test_pipeline.py      — stage-by-stage test harness
 fixtures/             — cached MSRC API responses
 data/                 — runtime output (gitignored)
