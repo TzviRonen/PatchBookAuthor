@@ -15,13 +15,15 @@ winbindex.py
   │  resolves pre-patch and post-patch PE files via winbindex + Microsoft Symbol Server
   ▼
 ghidriff_runner.py
-  │  runs Ghidra binary diff → markdown report with per-function diffs
+  │  runs Ghidra binary diff → ghidriff project (with PDB symbols) + markdown report
   ▼
 patch_identifier.py
-  │  heuristic scoring → Claude agent loop → identifies the patched function
+  │  heuristic scoring → Claude agent with Ghidra MCP decompilation → identifies
+  │  the patched function, gathers pre/post decompiled code + structured analysis
   ▼
 blog_generator.py
-     generates a kernel-developer blog post via Claude (claude-opus-4-8)
+     generates a technical security blog post via Claude using decompiled code,
+     structured vulnerability/fix/attack-vector fields, and the binary diff
 ```
 
 ## Prerequisites
@@ -114,13 +116,14 @@ All settings are environment variables with sensible defaults:
 
 **Binary resolution** uses [winbindex](https://winbindex.m417z.com/) to map KB numbers to PE file versions, then downloads from the Microsoft Symbol Server using the PE timestamp+virtualSize as the lookup key.
 
-**Patch identification** works in two phases:
+**Patch identification** works in three phases:
 1. Heuristic scoring ranks all changed functions by CVE keyword overlap, change size, and security patterns — no LLM calls.
-2. A Claude agent evaluates the top candidates one at a time (300s timeout per call), stopping at the first function with ≥75% confidence. It uses tool calls to fetch caller context on demand. After a primary patch is found, remaining high-scoring candidates are evaluated for co-patches (functions changed as part of the same fix).
+2. A Claude agent evaluates the top candidates one at a time (300s timeout per call) using a [GhidraMCP](https://github.com/LaurieWired/GhidraMCP) server for on-demand decompilation. The server opens the pre-analyzed ghidriff Ghidra project (which includes PDB symbols) so every function decompiles to named, readable pseudo-C. The agent stops at the first function with ≥75% confidence and records a structured verdict (`vulnerability_description`, `fix_description`, `attack_vector`). After the primary patch is found, remaining high-scoring candidates are evaluated for co-patches.
+3. After the verdict, `_gather_mcp_context` decompiles the primary function and all co-patches (pre + post binary) while the MCP server is still running, building a rich context block for the blog stage.
 
 Agent evaluation results are cached per-function in `data/cache/agent_evals/` so re-runs don't re-evaluate already-seen functions.
 
-**Blog generation** sends only the identified function's diff (not the full noisy report) to Claude, producing a focused technical writeup. If co-patches were found, they are included in the blog context.
+**Blog generation** receives the full decompiled pseudo-C (pre-patch and post-patch) for the primary function and every co-patch, alongside the structured analysis fields from the identify stage and the raw ghidriff diff. This produces deep, code-grounded writeups that quote variable names and control-flow patterns directly from the decompilation.
 
 ## Project layout
 

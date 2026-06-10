@@ -219,19 +219,36 @@ def run(cve_id: str, update_id: str | None, data_dir: Path, force: bool, skip_bl
             "pre_build": pre_build, "post_build": post_build,
         })
 
-    # ── Step 3: Ghidriff ───────────────────────────────────────────────────────
+    # ── Step 3: Ghidriff (+ concurrent MCP server startup) ────────────────────
     _print(3, TOTAL_STEPS, "Running ghidriff (20-40 min)...")
 
+    mcp_server = None
     cached = trace.get("ghidriff")
     if cached:
         diff_path = Path(cached["diff_path"])
         _print(3, TOTAL_STEPS, "Ghidriff (cached)",
                f"{cached['function_count']} changed functions")
+        # Diff is cached — still start MCP if identify stage will need it
+        if not trace.get("identify"):
+            from pipeline.ghidriff_runner import _start_mcp_background, _GHIDRA_PROJECTS_DIR
+            _base = f"ghidriff_{cve_id.replace('/', '-')}"
+            _proj_name = f"{_base}-{pre_path.name}-{post_path.name}"
+            _proj_dir = _GHIDRA_PROJECTS_DIR / _proj_name
+            _rep_idata = _proj_dir / f"{_proj_name}.rep" / "idata"
+            _gbf_files = list(_rep_idata.rglob("*.gbf")) if _rep_idata.is_dir() else []
+            _project_ready = bool(_gbf_files) and any(
+                f.stat().st_size > 10 * 1024 * 1024 for f in _gbf_files
+            )
+            mcp_server = _start_mcp_background(
+                pre_path, post_path,
+                project_dir=_proj_dir if _project_ready else None,
+                project_name=_proj_name,
+            )
     else:
         diffs_dir = data_dir / "diffs"
         diff_name = cve_id.replace("/", "-")
         try:
-            diff_path = run_ghidriff(pre_path, post_path, diffs_dir, diff_name)
+            diff_path, mcp_server = run_ghidriff(pre_path, post_path, diffs_dir, diff_name)
         except Exception as e:
             _fail(f"Ghidriff failed: {e}")
 
@@ -256,7 +273,6 @@ def run(cve_id: str, update_id: str | None, data_dir: Path, force: bool, skip_bl
             co_str = " + " + ", ".join(f"{c['name']} ({c['confidence']}%)" for c in co)
         _print(4, TOTAL_STEPS, "Identify (cached)",
                f"{cached['function_name']} ({cached['confidence']}%){co_str}")
-        # Reconstruct a minimal object for blog generator
         from pipeline.patch_identifier import PatchResult
         patch_result = PatchResult(
             function_name=cached["function_name"],
@@ -268,10 +284,40 @@ def run(cve_id: str, update_id: str | None, data_dir: Path, force: bool, skip_bl
             heuristic_scores=[],
             agent_evals=[],
             co_patches=co,
+            decompiled_pre=cached.get("decompiled_pre", ""),
+            decompiled_post=cached.get("decompiled_post", ""),
+            callers=cached.get("callers", []),
+            vulnerability_description=cached.get("vulnerability_description", ""),
+            fix_description=cached.get("fix_description", ""),
+            attack_vector=cached.get("attack_vector", ""),
         )
+        # No MCP needed — stop server if it was started
+        if mcp_server:
+            mcp_server.stop()
+            mcp_server = None
     else:
+        # Wait for MCP server to finish starting (ran concurrently with ghidriff)
+        mcp_ready = False
+        if mcp_server:
+            ready_event = getattr(mcp_server, "_ready_event", None)
+            start_error = getattr(mcp_server, "_start_error", [])
+            if ready_event:
+                print("  [mcp] waiting for MCP server to be ready ...", flush=True)
+                ready_event.wait()
+            if start_error:
+                print(f"  [mcp] WARNING: MCP server failed ({start_error[0]}) — "
+                      "falling back to one-shot identify", flush=True)
+                mcp_server = None
+            elif mcp_server.pre and mcp_server.post:
+                mcp_ready = True
+
         try:
-            patch_result = identify_patch(cve, diff_path)
+            if mcp_ready and mcp_server:
+                from pipeline.patch_identifier import identify_patch_with_mcp
+                patch_result = identify_patch_with_mcp(cve, diff_path, mcp_server)
+            else:
+                patch_result = identify_patch(cve, diff_path)
+
             co = patch_result.co_patches or []
             co_str = ""
             if co:
@@ -289,11 +335,21 @@ def run(cve_id: str, update_id: str | None, data_dir: Path, force: bool, skip_bl
                 "heuristic_scores": patch_result.heuristic_scores,
                 "agent_evals": patch_result.agent_evals,
                 "co_patches": patch_result.co_patches,
+                "decompiled_pre": patch_result.decompiled_pre,
+                "decompiled_post": patch_result.decompiled_post,
+                "callers": patch_result.callers,
+                "vulnerability_description": patch_result.vulnerability_description,
+                "fix_description": patch_result.fix_description,
+                "attack_vector": patch_result.attack_vector,
             })
         except PatchNotFoundError as e:
             print(f"       WARNING: {e} — falling back to full diff for blog")
         except Exception as e:
             print(f"       WARNING: patch identification error: {e} — falling back to full diff")
+        finally:
+            if mcp_server:
+                mcp_server.stop()
+                mcp_server = None
 
     # ── Step 5: Generate blog post ─────────────────────────────────────────────
     if skip_blog:

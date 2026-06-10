@@ -13,6 +13,7 @@ import re
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 log = logging.getLogger(__name__)
 
@@ -65,7 +66,15 @@ class PatchResult:
     agent_evals: list[dict]
     co_patches: list[dict] = field(default_factory=list)
     # co_patches entries: {"name": str, "confidence": int, "reasoning": str,
-    #                      "patch_type": str, "diff": str}
+    #                      "patch_type": str, "diff": str,
+    #                      "decompiled_pre": str, "decompiled_post": str}
+    # Rich context gathered after MCP identification — passed to blog generator
+    decompiled_pre: str = ""            # full pre-patch decompilation of primary function
+    decompiled_post: str = ""           # full post-patch decompilation of primary function
+    callers: list[str] = field(default_factory=list)   # callers of primary (post-patch)
+    vulnerability_description: str = ""  # structured: what the vulnerable code does and why
+    fix_description: str = ""            # structured: exactly what the patch adds/changes
+    attack_vector: str = ""              # structured: how an attacker exploits this
 
 
 class PatchNotFoundError(Exception):
@@ -920,3 +929,486 @@ def _make_result(sec: FunctionSection, ev: AgentEval, n: int,
                      for e in agent_evals],
         co_patches=co_patches or [],
     )
+
+
+# ---------------------------------------------------------------------------
+# MCP-backed agentic identify (replaces one-shot claude -p loop)
+# ---------------------------------------------------------------------------
+
+_MCP_AGENT_SYSTEM = """\
+You are a Windows kernel security researcher with live access to a Ghidra binary analysis server.
+You are investigating a CVE to identify which function(s) were patched.
+
+You have been given:
+- The CVE description (bug class, severity, affected component)
+- A ranked list of candidate functions from a ghidriff diff (heuristic scores)
+- Tools to interactively explore BOTH the pre-patch and post-patch binaries
+
+## Strategy
+
+1. Start with the top-ranked candidates from list_candidates.
+2. Call diff_function on the most promising one to see exactly what changed between builds.
+3. If the diff is compelling, call decompile_function on BOTH binaries to understand the full context.
+4. Follow the call graph: use get_callers and get_callees to understand whether this is the
+   outermost changed function or just a helper updated as a consequence of the real fix.
+5. If a candidate looks wrong, try the next one. Use search_functions to find related functions
+   not in the ghidriff list if a name pattern seems promising.
+6. Once confident, call submit_verdict.
+
+## What a security patch looks like
+
+**Use-after-free**: lock acquired around free sequence, missing sub-free calls added,
+reference count added before use.
+**TOCTOU**: stack-local copy of user pointer before double-use, ProbeForRead added.
+**EoP**: new privilege/token check, new STATUS_ACCESS_DENIED return path.
+**Buffer overflow**: new size/bounds check before copy, RtlSafeAdd*, length cap.
+**Info leak**: RtlZeroMemory added before returning buffer, min() cap on copy size.
+
+A real patch is usually 5-30 changed lines. Avoid flagging large refactors or cosmetic changes.
+The correct answer is the OUTERMOST changed function — not a callee updated as a side effect.
+
+When you have enough evidence, call submit_verdict.
+"""
+
+_MCP_TOOLS: list[dict] = [
+    {
+        "name": "list_candidates",
+        "description": (
+            "List the top heuristic-ranked candidate functions from the ghidriff diff, "
+            "with their scores and change sizes. Always start here."
+        ),
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
+    {
+        "name": "diff_function",
+        "description": (
+            "Show the decompiled diff for a function between the pre-patch and post-patch binary. "
+            "Returns the ghidriff-style unified diff of the pseudo-C. "
+            "Use this first on a candidate before decompiling both sides individually."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Exact function name"},
+            },
+            "required": ["name"],
+        },
+    },
+    {
+        "name": "decompile_function",
+        "description": (
+            "Decompile a function from either the pre-patch or post-patch binary. "
+            "Returns pseudo-C source. Use 'pre' to see the vulnerable version, "
+            "'post' to see the patched version."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Exact function name"},
+                "binary": {
+                    "type": "string",
+                    "enum": ["pre", "post"],
+                    "description": "Which binary to decompile from (pre=vulnerable, post=patched)",
+                },
+            },
+            "required": ["name", "binary"],
+        },
+    },
+    {
+        "name": "get_callers",
+        "description": (
+            "Get the list of functions that call the specified function. "
+            "Specify binary='pre' or 'post'. "
+            "Use this to check if a function is a leaf/helper or the true fix entry point."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "binary": {"type": "string", "enum": ["pre", "post"]},
+            },
+            "required": ["name", "binary"],
+        },
+    },
+    {
+        "name": "get_callees",
+        "description": (
+            "Get the list of functions called BY the specified function. "
+            "Useful to see if a function calls free/alloc/lock functions relevant to the bug class."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "binary": {"type": "string", "enum": ["pre", "post"]},
+            },
+            "required": ["name", "binary"],
+        },
+    },
+    {
+        "name": "get_xrefs",
+        "description": "Get cross-references to a function (all call sites).",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "binary": {"type": "string", "enum": ["pre", "post"]},
+            },
+            "required": ["name", "binary"],
+        },
+    },
+    {
+        "name": "search_functions",
+        "description": (
+            "Search function names by substring/pattern in either binary. "
+            "Useful for finding related functions not in the ghidriff candidate list, "
+            "e.g. searching 'PiSwDevice' to find all software-device lifecycle functions."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "pattern": {"type": "string", "description": "Substring or pattern to search"},
+                "binary": {"type": "string", "enum": ["pre", "post"]},
+            },
+            "required": ["pattern", "binary"],
+        },
+    },
+    {
+        "name": "submit_verdict",
+        "description": (
+            "Submit your final identification verdict. Call this when you are confident "
+            "you have found the patch function. This ends the investigation."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "function_name": {"type": "string", "description": "Name of the patched function"},
+                "confidence": {
+                    "type": "integer", "minimum": 0, "maximum": 100,
+                    "description": "Confidence percentage (0-100)",
+                },
+                "reasoning": {
+                    "type": "string",
+                    "description": "One concise sentence explaining why this is the patch",
+                },
+                "patch_type": {
+                    "type": "string",
+                    "enum": ["TOCTOU", "EoP", "buffer_overflow", "use_after_free",
+                             "null_deref", "info_leak", "other"],
+                },
+                "co_patches": {
+                    "type": "array",
+                    "description": "Other functions that received the same fix (optional)",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": "string"},
+                            "confidence": {"type": "integer"},
+                            "reasoning": {"type": "string"},
+                            "patch_type": {"type": "string"},
+                        },
+                        "required": ["name", "confidence", "reasoning", "patch_type"],
+                    },
+                },
+            },
+            "required": ["function_name", "confidence", "reasoning", "patch_type"],
+        },
+    },
+]
+
+_MCP_SESSION_TIMEOUT = 600   # seconds for the full agentic claude -p session
+
+_BRIDGE_SCRIPT = Path(__file__).parent.parent / "vendor" / "ghidra-mcp" / "bridge_mcp_ghidra.py"
+
+
+def identify_patch_with_mcp(
+    cve: dict,
+    diff_path: Path,
+    mcp: "GhidraMCPServer",  # type: ignore[name-defined]
+    gather_blog_context: bool = True,
+) -> PatchResult:
+    """
+    Agentic patch identification using live Ghidra tool calls via the MCP bridge.
+
+    Starts the bethington/ghidra-mcp bridge as an MCP stdio server and passes
+    it to `claude -p --mcp-config`, giving Claude native tool-calling access to
+    both binaries (decompile, xrefs, callers, search).  Works with OAuth auth
+    (no ANTHROPIC_API_KEY required).
+    """
+    import tempfile
+    from pipeline.config import CLAUDE_MODEL
+
+    if not _BRIDGE_SCRIPT.exists():
+        raise RuntimeError(
+            f"MCP bridge not found at {_BRIDGE_SCRIPT}. "
+            "Clone vendor/ghidra-mcp and ensure bridge_mcp_ghidra.py is present."
+        )
+
+    sections = parse_ghidriff_sections(diff_path)
+    if not sections:
+        raise PatchNotFoundError(f"No changed functions found in {diff_path}")
+
+    scored = rank_by_heuristics(sections, cve)
+    candidates = scored[:MAX_CANDIDATES]
+    sections_by_name = {s.section.name: s.section for s in scored}
+
+    heuristic_log = [
+        {"rank": i + 1, "name": s.section.name, "score": s.score,
+         "added": s.section.added_lines, "removed": s.section.removed_lines,
+         "reasons": s.score_reasons}
+        for i, s in enumerate(candidates)
+    ]
+
+    total = len(candidates)
+    print(f"  [identify/mcp] {len(sections)} changed functions — top {total} candidates", flush=True)
+    for entry in heuristic_log[:5]:
+        print(f"  [heuristic] #{entry['rank']:2d}  {entry['name']:<55}  "
+              f"score={entry['score']:.0f}  (+{entry['added']}/-{entry['removed']})  "
+              f"{', '.join(entry['reasons'][:4])}", flush=True)
+
+    cve_id = cve.get("id", "unknown")
+    cve_desc = cve.get("description", "(no description)")
+    port = mcp.port
+
+    system_prompt = f"""\
+You are a Windows kernel security researcher identifying which function(s) in ntoskrnl.exe were patched for a CVE.
+
+You have live access to a Ghidra MCP server running locally (port {port}) with two builds loaded:
+- Pre-patch (vulnerable): `{mcp.pre}`
+- Post-patch (fixed): `{mcp.post}`
+
+The server was auto-connected when the bridge started — you can immediately use Ghidra tools without calling connect_instance.
+
+## Key tools
+
+- `decompile_function(address=FUNC_NAME, program=PROGRAM_NAME)` — decompile pseudo-C from either binary.  Use `program="{mcp.pre}"` for the vulnerable version, `program="{mcp.post}"` for the fixed version.
+- `search_functions(name_pattern=SUBSTRING, program=PROGRAM_NAME)` — find functions by name pattern.
+- `get_function_callers(name=FUNC_NAME, program=PROGRAM_NAME)` — what calls this function.
+- `get_function_callees(name=FUNC_NAME, program=PROGRAM_NAME)` — what this function calls.
+- `list_open_programs()` — confirm which programs are loaded.
+
+## Investigation strategy
+
+1. Start by decompiling the #1 heuristic candidate in BOTH binaries (pre and post) to see the change.
+2. Check callers to determine if this is the outermost changed function or a callee updated as a side effect.
+3. If the top candidate doesn't fit the CVE, try the next candidates.
+4. Use search_functions to find related functions by name pattern if needed.
+
+## What security patches look like
+
+- **TOCTOU**: stack-local copy of user pointer before double-use, ProbeForRead/ProbeForWrite added, atomic insertion helper added.
+- **EoP**: new privilege/token check, new STATUS_ACCESS_DENIED return path, new access mask validation.
+- **Use-after-free**: lock around free sequence, missing dereference guards added, ref-count check added.
+- **Buffer overflow**: new size/bounds check, RtlSafeAdd*, length cap before RtlCopy*.
+- **Info leak**: RtlZeroMemory added before returning buffer, min() cap on copy size.
+
+A real patch is usually 5-30 changed lines. The answer is the OUTERMOST changed function — not a callee updated as a side effect.
+
+## Output format
+
+When confident, end your response with a JSON verdict block tagged with ```json:
+
+```json
+{{
+  "function_name": "ExactFunctionName",
+  "confidence": 90,
+  "reasoning": "One concise sentence explaining the specific change that fixes the CVE.",
+  "patch_type": "TOCTOU",
+  "vulnerability_description": "2-3 sentences: which specific operations on which data create the race/bug, what kernel invariant is violated, and under what conditions the bug triggers. Reference concrete variable names or operations you observed in the decompiled code.",
+  "fix_description": "2-3 sentences: exactly what was added or changed in the patch — name the specific helpers, checks, probes, or restructured operations introduced, and how they close the vulnerability.",
+  "attack_vector": "1-2 sentences: what a racing or attacking thread does to reach and exploit the bug, and what primitive it achieves (arbitrary write, info-leak, UAF, etc.).",
+  "co_patches": [
+    {{"name": "HelperFunctionName", "confidence": 85, "reasoning": "...", "patch_type": "TOCTOU"}}
+  ]
+}}
+```
+
+patch_type must be one of: TOCTOU, EoP, buffer_overflow, use_after_free, null_deref, info_leak, other
+co_patches should list other functions that received the same fix (can be empty list []).
+"""
+
+    user_message = f"""\
+## CVE Under Investigation
+
+- **CVE ID**: {cve_id}
+- **Title**: {cve.get('title', '')}
+- **CVSS**: {cve.get('cvss', 'unknown')}
+- **Description**: {cve_desc[:1200]}
+
+## Heuristic Top-10 Candidates (from ghidriff diff, sorted by patch likelihood)
+
+{chr(10).join(
+    f"{e['rank']:2d}. {e['name']:<55} score={e['score']:.0f}  "
+    f"(+{e['added']}/-{e['removed']} lines)  {', '.join(e['reasons'][:3])}"
+    for e in heuristic_log[:10]
+)}
+
+Full candidate list ({len(candidates)} total):
+{chr(10).join(
+    f"  {e['rank']:2d}. {e['name']}  (+{e['added']}/-{e['removed']})"
+    for e in heuristic_log[10:]
+)}
+
+Investigate the top candidates using the Ghidra tools. Start with decompile_function on candidate #1 in both binaries, then follow the evidence.
+"""
+
+    # Write MCP config pointing at the bridge (uses /opt/venv python so mcp is available)
+    import os as _os
+    venv_python = str(Path(_os.path.dirname(_os.sys.executable)) / "python")
+    mcp_config = {
+        "mcpServers": {
+            "ghidra": {
+                "command": venv_python,
+                "args": [str(_BRIDGE_SCRIPT), "--transport", "stdio"],
+                "env": {
+                    "GHIDRA_MCP_URL": f"http://127.0.0.1:{port}",
+                },
+            }
+        }
+    }
+
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".json", prefix="ghidra_mcp_cfg_", delete=False
+    ) as f:
+        json.dump(mcp_config, f)
+        cfg_path = f.name
+
+    print(f"  [identify/mcp] starting claude -p agent session (model={CLAUDE_MODEL}) ...", flush=True)
+    print(f"  [identify/mcp] bridge: {_BRIDGE_SCRIPT.name}  ghidra port: {port}", flush=True)
+
+    try:
+        result = subprocess.run(
+            [
+                "claude", "-p",
+                "--mcp-config", cfg_path,
+                "--system-prompt", system_prompt,
+                "--dangerously-skip-permissions",
+                "--model", CLAUDE_MODEL,
+                user_message,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=_MCP_SESSION_TIMEOUT,
+        )
+    finally:
+        Path(cfg_path).unlink(missing_ok=True)
+
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"claude -p MCP session failed (exit {result.returncode}): "
+            f"{result.stderr[:500]}"
+        )
+
+    output = result.stdout
+    print(f"  [identify/mcp] session complete ({len(output)} chars output)", flush=True)
+
+    verdict = _parse_mcp_verdict(output)
+    if verdict is None:
+        log.warning("Could not parse JSON verdict from MCP session output:\n%s", output[-2000:])
+        raise PatchNotFoundError(
+            f"MCP agent session completed but produced no parseable verdict for {cve_id}"
+        )
+
+    fn_name = verdict["function_name"]
+    confidence = int(verdict.get("confidence", 0))
+    reasoning = verdict.get("reasoning", "")
+    patch_type = verdict.get("patch_type", "other")
+    co_patch_verdicts = verdict.get("co_patches") or []
+
+    print(f"  [identify/mcp] ✓  {fn_name}  confidence={confidence}%  type={patch_type}", flush=True)
+    print(f"  [identify/mcp]    {reasoning[:120]}", flush=True)
+
+    sec = sections_by_name.get(fn_name)
+    if sec is None:
+        sec = FunctionSection(name=fn_name, diff_text="(retrieved via MCP tools)",
+                              added_lines=0, removed_lines=0, has_signature_change=False)
+
+    ev = AgentEval(fn_name=fn_name, is_patch=True, confidence=confidence,
+                   reasoning=reasoning, patch_type=patch_type)
+
+    co_patches: list[dict] = []
+    for cp in co_patch_verdicts:
+        cp_name = cp.get("name", "")
+        cp_sec = sections_by_name.get(cp_name)
+        co_patches.append({
+            "name": cp_name,
+            "confidence": int(cp.get("confidence", 0)),
+            "reasoning": cp.get("reasoning", ""),
+            "patch_type": cp.get("patch_type", "other"),
+            "diff": cp_sec.diff_text if cp_sec else "(retrieved via MCP tools)",
+            "decompiled_pre": "",
+            "decompiled_post": "",
+        })
+
+    result = _make_result(sec, ev, 0, heuristic_log, [], co_patches)
+
+    # Populate structured fields from the agent's richer verdict
+    result.vulnerability_description = verdict.get("vulnerability_description", "")
+    result.fix_description = verdict.get("fix_description", "")
+    result.attack_vector = verdict.get("attack_vector", "")
+
+    # Gather decompiled code for blog generation (while MCP server is still running)
+    if gather_blog_context:
+        try:
+            co_names = [cp["name"] for cp in co_patches]
+            ctx = _gather_mcp_context(mcp, fn_name, co_names)
+            result.decompiled_pre = ctx.get("decompiled_pre", "")
+            result.decompiled_post = ctx.get("decompiled_post", "")
+            result.callers = ctx.get("callers", [])
+            for i, co in enumerate(result.co_patches):
+                co["decompiled_pre"] = ctx.get(f"co_{i}_decompiled_pre", "")
+                co["decompiled_post"] = ctx.get(f"co_{i}_decompiled_post", "")
+        except Exception as e:
+            log.warning("Failed to gather MCP blog context: %s", e)
+
+    return result
+
+
+def _parse_mcp_verdict(output: str) -> dict | None:
+    """Extract and parse the first JSON verdict block from Claude's output."""
+    m = re.search(r"```json\s*(\{.*?\})\s*```", output, re.DOTALL)
+    if not m:
+        m = re.search(r'\{\s*"function_name"\s*:.*?\}', output, re.DOTALL)
+    if not m:
+        return None
+    try:
+        data = json.loads(m.group(1) if "```json" in output and m.lastindex else m.group(0))
+        if "function_name" not in data:
+            return None
+        return data
+    except json.JSONDecodeError:
+        return None
+
+
+_DECOMPILE_TRUNCATE = 8_000  # chars per function per binary in blog context
+
+
+def _gather_mcp_context(
+    mcp: "GhidraMCPServer",  # type: ignore[name-defined]
+    fn_name: str,
+    co_names: list[str],
+) -> dict:
+    """After identifying the patch, decompile the patched functions for blog generation.
+
+    Returns a dict with decompiled_pre, decompiled_post, callers, and per-co-patch
+    decompilations keyed as co_{i}_decompiled_pre / co_{i}_decompiled_post.
+    """
+    def _decompile(name: str, program: str) -> str:
+        result = mcp.decompile_function(name, program)
+        # decompile_function returns "[decompile error: ...]" on failure — treat as empty
+        if result.startswith("[decompile error"):
+            return ""
+        return result[:_DECOMPILE_TRUNCATE]
+
+    ctx: dict = {}
+    print(f"  [mcp/blog-ctx] decompiling {fn_name} (pre + post) ...", flush=True)
+    ctx["decompiled_pre"] = _decompile(fn_name, mcp.pre)
+    ctx["decompiled_post"] = _decompile(fn_name, mcp.post)
+    ctx["callers"] = mcp.get_callers(fn_name, mcp.post)
+
+    for i, name in enumerate(co_names):
+        print(f"  [mcp/blog-ctx] decompiling co-patch {name} (pre + post) ...", flush=True)
+        ctx[f"co_{i}_decompiled_pre"] = _decompile(name, mcp.pre)
+        ctx[f"co_{i}_decompiled_post"] = _decompile(name, mcp.post)
+
+    return ctx
