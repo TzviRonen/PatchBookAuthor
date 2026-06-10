@@ -156,7 +156,31 @@ def cve_blog(cve_id: str):
     back_label = "All Blogs" if back == "blogs" else cve_id
     return render_template("markdown_view.html", title=f"{cve_id} — Blog Post",
                            content_html=html, back_url=back_url,
-                           back_label=back_label, raw=raw)
+                           back_label=back_label, raw=raw,
+                           feedback_url=f"/cve/{cve_id}/blog/feedback")
+
+
+@app.route("/cve/<cve_id>/blog/feedback", methods=["POST"])
+def cve_blog_feedback(cve_id: str):
+    p = _find_blog(cve_id)
+    if not p:
+        return jsonify({"error": "Blog not found"}), 404
+    data = request.get_json(silent=True) or {}
+    text = (data.get("feedback") or "").strip()
+    if not text:
+        return jsonify({"error": "Feedback text required"}), 400
+
+    content = p.read_text(encoding="utf-8")
+    date_str = datetime.utcnow().strftime("%Y-%m-%d")
+    entry = f"- **[{date_str}]**: {text}"
+
+    if "## Feedback" in content:
+        content = content.rstrip() + f"\n{entry}\n"
+    else:
+        content = content.rstrip() + f"\n\n## Feedback\n\n{entry}\n"
+
+    p.write_text(content, encoding="utf-8")
+    return jsonify({"ok": True})
 
 
 @app.route("/cve/<cve_id>/diff")

@@ -37,10 +37,66 @@
       <div class="terminal" style="max-height:80vh;border:none;border-radius:0;">{{ raw }}</div>
     </div>
   </div>
+
+  {% if feedback_url %}
+  <div class="card mt2" id="feedback-card">
+    <div class="card-header">
+      <h3>Leave Feedback</h3>
+    </div>
+    <div class="card-body">
+      <div class="form-row">
+        <label for="feedback-text">Your feedback on this post</label>
+        <textarea id="feedback-text" rows="4"
+          style="width:100%;background:var(--bg);border:1px solid var(--border);color:var(--text);
+                 border-radius:6px;padding:0.6rem 0.85rem;font-size:0.95rem;font-family:var(--font-ui);
+                 outline:none;resize:vertical;transition:border-color 0.15s,box-shadow 0.15s;"
+          onfocus="this.style.borderColor='var(--blue)';this.style.boxShadow='0 0 0 3px rgba(9,105,218,0.12)'"
+          onblur="this.style.borderColor='var(--border)';this.style.boxShadow='none'"
+          placeholder="Share your thoughts, corrections, or questions about this analysis…"></textarea>
+      </div>
+      <div style="display:flex;align-items:center;gap:1rem;">
+        <button class="btn btn-blue" onclick="submitFeedback()">Submit Feedback</button>
+        <span id="feedback-status" style="font-size:0.88rem;"></span>
+      </div>
+    </div>
+  </div>
+  {% endif %}
 </div>
 {% endblock %}
 {% block scripts %}
 <script>
+{% if feedback_url %}
+async function submitFeedback() {
+  const text = document.getElementById('feedback-text').value.trim();
+  const status = document.getElementById('feedback-status');
+  if (!text) {
+    status.style.color = 'var(--red)';
+    status.textContent = 'Please enter some feedback before submitting.';
+    return;
+  }
+  status.style.color = 'var(--muted)';
+  status.textContent = 'Saving…';
+  try {
+    const res = await fetch('{{ feedback_url }}', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({feedback: text}),
+    });
+    const data = await res.json();
+    if (data.ok) {
+      status.style.color = 'var(--green)';
+      status.textContent = 'Feedback saved to the blog post file.';
+      document.getElementById('feedback-text').value = '';
+    } else {
+      status.style.color = 'var(--red)';
+      status.textContent = data.error || 'Failed to save feedback.';
+    }
+  } catch (e) {
+    status.style.color = 'var(--red)';
+    status.textContent = 'Network error — could not save feedback.';
+  }
+}
+{% endif %}
 let isRaw = false;
 function toggleView() {
   isRaw = !isRaw;

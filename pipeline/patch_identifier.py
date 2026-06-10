@@ -1204,6 +1204,18 @@ The server was auto-connected when the bridge started — you can immediately us
 
 A real patch is usually 5-30 changed lines. The answer is the OUTERMOST changed function — not a callee updated as a side effect.
 
+## Feature_* flag semantics — critical for correct identification
+
+Microsoft uses `Feature_XXXXXXXXX__private_IsEnabledDeviceUsage()` as CFR (Controlled Feature Rollout) killswitches. They **return `true` (non-zero) by default** — the new code is ON by default and can be remotely switched off in an emergency.
+
+This has two important implications:
+
+1. **A function that REMOVES a Feature_* gate is NOT the primary patch.**
+   If the pre-patch had `if (Feature_X() != 0 && (validation_check))` and the post-patch just has `if (validation_check)`, the behavior is UNCHANGED (flag was already true → validation always ran). This is a follow-up cleanup commit that removes the killswitch after the fix proved stable. The REAL security fix was in a prior update.
+
+2. **A function that ADDS Feature_* gates around new code IS a new change.**
+   If the post-patch wraps new logic in `if (Feature_X() != 0) {{ new_behavior }} else {{ old_behavior }}`, that new behavior is the actual fix (active by default, rollback possible). Evaluate whether the new behavior fixes the CVE's bug class.
+
 ## Output format
 
 When confident, end your response with a JSON verdict block tagged with ```json:
