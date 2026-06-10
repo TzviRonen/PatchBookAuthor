@@ -63,11 +63,12 @@ Output is written to `./data/`:
 
 | Path | Contents |
 |------|----------|
-| `data/binaries/<CVE-ID>/` | Downloaded PE files |
-| `data/diffs/` | ghidriff markdown reports |
+| `data/binaries/<CVE-ID>/` | Downloaded PE files (pre + post patch) |
+| `data/diffs/` | ghidriff markdown reports, JSON diffs, and Ghidra projects (`.gzf`) |
+| `data/symbols/` | Downloaded PDB symbol files |
 | `data/blogs/` | Generated blog posts |
 | `data/traces/<CVE-ID>.json` | Per-CVE stage cache (crash recovery) |
-| `data/cache/agent_evals/` | Cached Claude agent evaluations per function |
+| `data/cache/agent_evals/` | Cached Claude/MCP agent evaluations per function |
 | `data/db/pipeline.db` | SQLite state (processed CVEs, daemon mode) |
 
 ## Running outside Docker (development)
@@ -132,14 +133,16 @@ pipeline/
   msrc.py             — MSRC CVRF v2.0 API client
   winbindex.py        — binary version resolution + download
   kernel_filter.py    — CVE-to-binary classifier
-  ghidriff_runner.py  — Ghidra diff runner
-  patch_identifier.py — heuristic ranker + Claude agent evaluator
+  ghidriff_runner.py  — Ghidra diff runner (produces PDB-resolved project)
+  ghidra_mcp.py       — GhidraMCP server lifecycle + HTTP client
+  patch_identifier.py — heuristic ranker + Claude/MCP agent evaluator
   blog_generator.py   — Claude blog post generator
   database.py         — SQLite state tracking
   config.py           — environment-based configuration
   main.py             — orchestrator + CLI entry point
 run_cve.py            — single-CVE runner (development entry point)
 test_pipeline.py      — stage-by-stage test harness
+vendor/ghidra-mcp/    — GhidraMCP server (submodule)
 fixtures/             — cached MSRC API responses
 data/                 — runtime output (gitignored)
 ```
