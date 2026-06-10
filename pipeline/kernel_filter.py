@@ -9,7 +9,7 @@ _RULES: list[tuple[re.Pattern, str]] = [
     (re.compile(r"\bclfs\b|common log file", re.I),    "clfs.sys"),
     (re.compile(r"\bafd\.sys\b|\bafd driver\b|winsock auxiliary", re.I), "afd.sys"),
     (re.compile(r"\bndis\b|network driver interface", re.I), "ndis.sys"),
-    (re.compile(r"\btcpip\b|tcp/ip driver", re.I),     "tcpip.sys"),
+    (re.compile(r"\btcpip\b|tcp/ip", re.I),              "tcpip.sys"),
     (re.compile(r"\bntfs\b", re.I),                    "ntfs.sys"),
     (re.compile(r"\bfastfat\b", re.I),                 "fastfat.sys"),
     (re.compile(r"\bsrv2\b|smb server|smb2", re.I),   "srv2.sys"),

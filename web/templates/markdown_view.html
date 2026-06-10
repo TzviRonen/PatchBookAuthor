@@ -20,26 +20,15 @@
       <h1 style="font-size:1.1rem;font-family:var(--font-mono);">{{ title }}</h1>
     </div>
     <div class="diff-toolbar">
+      {% if feedback_url %}
+      <button onclick="toggleFeedback()" id="feedback-toggle" class="btn btn-blue" style="font-size:0.78rem;">Leave Feedback</button>
+      {% endif %}
       <button onclick="toggleView()" id="view-toggle" class="btn btn-muted" style="font-size:0.78rem;">Raw</button>
     </div>
   </div>
 
-  <div id="rendered-view" class="card">
-    <div class="card-body">
-      <div class="prose">
-        {{ content_html | safe }}
-      </div>
-    </div>
-  </div>
-
-  <div id="raw-view" class="card" style="display:none;">
-    <div class="card-body" style="padding:0;">
-      <div class="terminal" style="max-height:80vh;border:none;border-radius:0;">{{ raw }}</div>
-    </div>
-  </div>
-
   {% if feedback_url %}
-  <div class="card mt2" id="feedback-card">
+  <div class="card mt2" id="feedback-card" style="display:none;">
     <div class="card-header">
       <h3>Leave Feedback</h3>
     </div>
@@ -55,17 +44,39 @@
           placeholder="Share your thoughts, corrections, or questions about this analysis…"></textarea>
       </div>
       <div style="display:flex;align-items:center;gap:1rem;">
-        <button class="btn btn-blue" onclick="submitFeedback()">Submit Feedback</button>
+        <button class="btn btn-blue" onclick="submitFeedback()">Submit</button>
         <span id="feedback-status" style="font-size:0.88rem;"></span>
       </div>
     </div>
   </div>
   {% endif %}
+
+  <div id="rendered-view" class="card">
+    <div class="card-body">
+      <div class="prose">
+        {{ content_html | safe }}
+      </div>
+    </div>
+  </div>
+
+  <div id="raw-view" class="card" style="display:none;">
+    <div class="card-body" style="padding:0;">
+      <div class="terminal" style="max-height:80vh;border:none;border-radius:0;">{{ raw }}</div>
+    </div>
+  </div>
+
 </div>
 {% endblock %}
 {% block scripts %}
 <script>
 {% if feedback_url %}
+function toggleFeedback() {
+  const card = document.getElementById('feedback-card');
+  const btn = document.getElementById('feedback-toggle');
+  const visible = card.style.display !== 'none';
+  card.style.display = visible ? 'none' : '';
+  btn.textContent = visible ? 'Leave Feedback' : 'Hide Feedback';
+}
 async function submitFeedback() {
   const text = document.getElementById('feedback-text').value.trim();
   const status = document.getElementById('feedback-status');
