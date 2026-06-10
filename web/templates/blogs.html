@@ -17,7 +17,7 @@
   {% else %}
   <div style="display:flex;flex-direction:column;gap:1.25rem;">
     {% for item in items %}
-    <a href="/cve/{{ item.cve_id }}/blog?from=blogs" style="text-decoration:none;color:inherit;">
+    <a href="{{ item.url }}?from=blogs" style="text-decoration:none;color:inherit;">
     <div class="card" style="transition:box-shadow 0.15s,border-color 0.15s;cursor:pointer;"
          onmouseover="this.style.borderColor='#0969da';this.style.boxShadow='0 4px 16px rgba(9,105,218,0.10)'"
          onmouseout="this.style.borderColor='#d0d7de';this.style.boxShadow='0 1px 3px rgba(31,35,40,0.08)'">

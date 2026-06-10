@@ -150,7 +150,8 @@ def find_update_for_cve(cve_id: str) -> tuple[str, dict]:
 TOTAL_STEPS = 6
 
 
-def run(cve_id: str, update_id: str | None, data_dir: Path, force: bool, skip_blog: bool = False) -> None:
+def run(cve_id: str, update_id: str | None, data_dir: Path, force: bool,
+        skip_blog: bool = False, allow_web: bool = True) -> None:
     traces_dir = data_dir / "traces"
     trace = Trace(traces_dir / f"{cve_id}.json")
 
@@ -314,7 +315,8 @@ def run(cve_id: str, update_id: str | None, data_dir: Path, force: bool, skip_bl
         try:
             if mcp_ready and mcp_server:
                 from pipeline.patch_identifier import identify_patch_with_mcp
-                patch_result = identify_patch_with_mcp(cve, diff_path, mcp_server)
+                patch_result = identify_patch_with_mcp(cve, diff_path, mcp_server,
+                                                       allow_web=allow_web)
             else:
                 patch_result = identify_patch(cve, diff_path)
 
@@ -373,7 +375,7 @@ def run(cve_id: str, update_id: str | None, data_dir: Path, force: bool, skip_bl
         _print(5, TOTAL_STEPS, "Blog (cached)", str(blog_path))
     else:
         try:
-            blog_text = generate_blog_post(
+            blog_text, blog_prompt = generate_blog_post(
                 cve, binary_name,
                 patch_result=patch_result,
                 diff_path=diff_path if patch_result is None else None,
@@ -382,7 +384,8 @@ def run(cve_id: str, update_id: str | None, data_dir: Path, force: bool, skip_bl
             _fail(f"Blog generation failed: {e}")
 
         blogs_dir = data_dir / "blogs"
-        blog_path = save_blog_post(blog_text, cve_id, blogs_dir, title=cve.get("title", ""))
+        blog_path = save_blog_post(blog_text, cve_id, blogs_dir,
+                                   title=cve.get("title", ""), prompt=blog_prompt)
         _print(5, TOTAL_STEPS, "Blog post written", str(blog_path))
         trace.save("blog", {"blog_path": str(blog_path)})
 
@@ -437,6 +440,16 @@ def main() -> None:
         choices=["msrc", "binaries", "ghidriff", "identify", "blog"],
         help="Clear and re-run from this stage onwards (ignores --force).",
     )
+    parser.add_argument(
+        "--disable-web",
+        action="store_true",
+        default=False,
+        help=(
+            "Restrict the MCP identify agent to Ghidra tools only, blocking internet "
+            "access. By default the agent can also use built-in tools (Bash, Read, etc.) "
+            "which allows it to consult external resources."
+        ),
+    )
     args = parser.parse_args()
 
     cve_id = _parse_cve_id(args.cve)
@@ -453,7 +466,8 @@ def main() -> None:
             trace.clear(stage)
         print(f"  Cleared stages from '{args.from_stage}' onwards.\n")
 
-    run(cve_id, args.update_id, data_dir, force=args.force, skip_blog=args.skip_blog)
+    run(cve_id, args.update_id, data_dir, force=args.force, skip_blog=args.skip_blog,
+        allow_web=not args.disable_web)
 
 
 if __name__ == "__main__":

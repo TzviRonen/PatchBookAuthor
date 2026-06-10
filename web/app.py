@@ -21,12 +21,41 @@ DIFFS_DIR = DATA_DIR / "diffs"
 BINARIES_DIR = DATA_DIR / "binaries"
 LOG_FILE = DATA_DIR / "diffs" / "ghidriff.log"
 RUN_TRACE = DATA_DIR / "run_trace.json"
+RUNS_FILE = DATA_DIR / "runs.json"
 
 app = Flask(__name__, template_folder="templates")
 
 # ── running tasks ──────────────────────────────────────────────────────────────
 
 tasks: dict[str, dict] = {}  # task_id → {status, output_lines, proc, cve_id, started_at}
+_runs_lock = threading.Lock()
+
+
+def _load_runs() -> list[dict]:
+    if RUNS_FILE.exists():
+        try:
+            return json.loads(RUNS_FILE.read_text())
+        except Exception:
+            return []
+    return []
+
+
+def _append_run(entry: dict) -> None:
+    with _runs_lock:
+        runs = _load_runs()
+        runs.append(entry)
+        RUNS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        RUNS_FILE.write_text(json.dumps(runs, indent=2))
+
+
+def _update_run(task_id: str, **fields) -> None:
+    with _runs_lock:
+        runs = _load_runs()
+        for r in runs:
+            if r["task_id"] == task_id:
+                r.update(fields)
+                break
+        RUNS_FILE.write_text(json.dumps(runs, indent=2))
 
 
 def _stream_proc(task_id: str, proc: subprocess.Popen) -> None:
@@ -40,6 +69,16 @@ def _stream_proc(task_id: str, proc: subprocess.Popen) -> None:
     t["status"] = "done" if proc.returncode == 0 else "failed"
     t["ended_at"] = datetime.utcnow().isoformat()
     t["queue"].put(None)  # sentinel
+    update = {"status": t["status"], "ended_at": t["ended_at"], "returncode": t["returncode"]}
+    # Capture the blog path generated in this run so dashboard cards link to the right file
+    try:
+        trace = _load_trace(t["cve_id"])
+        bp = trace.get("stages", {}).get("blog", {}).get("result", {}).get("blog_path", "")
+        if bp:
+            update["blog_path"] = bp
+    except Exception:
+        pass
+    _update_run(task_id, **update)
 
 
 # ── helpers ────────────────────────────────────────────────────────────────────
@@ -127,10 +166,46 @@ def _file_size(p: Path) -> str:
 
 @app.route("/")
 def dashboard():
-    cves = _all_cves()
-    running = [t for t in tasks.values() if t["status"] == "running"]
-    return render_template("dashboard.html", cves=cves, stages=STAGES,
-                           stage_labels=STAGE_LABELS, running_count=len(running))
+    runs = _load_runs()
+    task_lookup = {t["id"]: t for t in tasks.values()}
+
+    cards = []
+    for r in reversed(runs):  # newest first
+        tid = r["task_id"]
+        live = task_lookup.get(tid)
+        status = live["status"] if live else r.get("status", "unknown")
+        ended_at = (live.get("ended_at") if live else None) or r.get("ended_at")
+        returncode = (live.get("returncode") if live else r.get("returncode"))
+
+        cve_id = r["cve_id"]
+        trace = _load_trace(cve_id)
+        stages_done = trace.get("stages", {})
+        completed = [s for s in STAGES if stages_done.get(s, {}).get("status") == "done"]
+        cve_meta = stages_done.get("msrc", {}).get("result", {}).get("cve", {})
+
+        blog_path_str = r.get("blog_path", "")
+        if blog_path_str:
+            blog_url = f"/blogs/{Path(blog_path_str).name}"
+        else:
+            blog_url = None
+
+        cards.append({
+            "task_id": tid,
+            "cve_id": cve_id,
+            "status": status,
+            "started_at": r.get("started_at", ""),
+            "ended_at": ended_at,
+            "returncode": returncode,
+            "title": cve_meta.get("title", ""),
+            "cvss": cve_meta.get("cvss"),
+            "completed_stages": completed,
+            "blog_url": blog_url,
+            "has_diff": _find_diff_for_cve(cve_id) is not None,
+        })
+
+    running_count = sum(1 for c in cards if c["status"] == "running")
+    return render_template("dashboard.html", cards=cards, stages=STAGES,
+                           stage_labels=STAGE_LABELS, running_count=running_count)
 
 
 @app.route("/cve/<cve_id>")
@@ -237,6 +312,7 @@ def blogs_list():
         items.append({
             "name": p.name,
             "cve_id": cve_id,
+            "url": f"/blogs/{p.name}",
             "size": _file_size(p),
             "title": meta["title"],
             "subtitle": meta["subtitle"],
@@ -244,6 +320,55 @@ def blogs_list():
             "cvss": cvss,
         })
     return render_template("blogs.html", items=items)
+
+
+@app.route("/blogs/<path:filename>")
+def blog_file(filename: str):
+    p = BLOGS_DIR / filename
+    if not p.exists() or p.suffix != ".md":
+        return render_template("error.html", msg=f"Blog post not found: {filename}"), 404
+    cve_id = filename.split("_")[0]
+    raw = p.read_text()
+    html = _md_to_html(raw)
+    return render_template("markdown_view.html", title=f"{cve_id} — Blog Post",
+                           content_html=html, back_url="/blogs",
+                           back_label="All Blogs", raw=raw,
+                           feedback_url=f"/blogs/{filename}/feedback")
+
+
+@app.route("/blogs/<path:filename>/prompt")
+def blog_prompt(filename: str):
+    p = BLOGS_DIR / Path(filename).with_suffix(".prompt.txt")
+    if not p.exists():
+        return render_template("error.html", msg=f"No prompt file found for {filename}. Re-run the pipeline to generate one."), 404
+    raw = p.read_text(encoding="utf-8")
+    return render_template("markdown_view.html",
+                           title=f"{filename} — Raw Blog Prompt",
+                           content_html=f'<pre style="white-space:pre-wrap;word-break:break-word;font-family:var(--font-mono);font-size:0.85rem;line-height:1.6;color:#c9d1d9;">{raw.replace("<","&lt;").replace(">","&gt;")}</pre>',
+                           back_url=f"/blogs/{filename}",
+                           back_label="Blog Post",
+                           raw=raw,
+                           feedback_url=None)
+
+
+@app.route("/blogs/<path:filename>/feedback", methods=["POST"])
+def blog_file_feedback(filename: str):
+    p = BLOGS_DIR / filename
+    if not p.exists() or p.suffix != ".md":
+        return jsonify({"error": "Blog not found"}), 404
+    data = request.get_json(silent=True) or {}
+    text = (data.get("feedback") or "").strip()
+    if not text:
+        return jsonify({"error": "Feedback text required"}), 400
+    content = p.read_text(encoding="utf-8")
+    date_str = datetime.utcnow().strftime("%Y-%m-%d")
+    entry = f"- **[{date_str}]**: {text}"
+    if "## Feedback" in content:
+        content = content.rstrip() + f"\n{entry}\n"
+    else:
+        content = content.rstrip() + f"\n\n## Feedback\n\n{entry}\n"
+    p.write_text(content, encoding="utf-8")
+    return jsonify({"ok": True})
 
 
 @app.route("/binaries")
@@ -297,6 +422,7 @@ def run_task():
     update_id = request.form.get("update_id", "").strip() or None
     force = request.form.get("force") == "1"
     skip_blog = request.form.get("skip_blog") == "1"
+    disable_web = request.form.get("disable_web") == "1"
     from_stage = request.form.get("from_stage", "").strip() or None
 
     cmd = [sys.executable, str(BASE_DIR / "run_cve.py"), cve_id]
@@ -306,10 +432,13 @@ def run_task():
         cmd.append("--force")
     if skip_blog:
         cmd.append("--skip-blog")
+    if disable_web:
+        cmd.append("--disable-web")
     if from_stage:
         cmd += ["--from-stage", from_stage]
 
     task_id = str(uuid.uuid4())[:8]
+    started_at = datetime.utcnow().isoformat()
     env = {**os.environ, "PYTHONUNBUFFERED": "1", "PYTHONFAULTHANDLER": "1"}
     proc = subprocess.Popen(
         cmd,
@@ -328,10 +457,19 @@ def run_task():
         "output_lines": [],
         "queue": queue.Queue(),
         "proc": proc,
-        "started_at": datetime.utcnow().isoformat(),
+        "started_at": started_at,
         "ended_at": None,
         "returncode": None,
     }
+    _append_run({
+        "task_id": task_id,
+        "cve_id": cve_id,
+        "cmd": " ".join(cmd),
+        "started_at": started_at,
+        "status": "running",
+        "ended_at": None,
+        "returncode": None,
+    })
     threading.Thread(target=_stream_proc, args=(task_id, proc), daemon=True).start()
     return jsonify({"task_id": task_id})
 
@@ -374,8 +512,29 @@ def task_stream(task_id: str):
 def task_detail(task_id: str):
     t = tasks.get(task_id)
     if not t:
-        return render_template("error.html", msg=f"Task {task_id!r} not found (tasks are in-memory and lost on server restart)."), 404
-    return render_template("task_detail.html", task=t)
+        for r in _load_runs():
+            if r["task_id"] == task_id:
+                t = {
+                    "id": task_id,
+                    "cve_id": r["cve_id"],
+                    "cmd": r.get("cmd", ""),
+                    "status": r.get("status", "unknown"),
+                    "output_lines": [],
+                    "started_at": r.get("started_at", ""),
+                    "ended_at": r.get("ended_at"),
+                    "returncode": r.get("returncode"),
+                }
+                break
+        if not t:
+            return render_template("error.html", msg=f"Task {task_id!r} not found."), 404
+
+    identify_result = None
+    trace = _load_trace(t["cve_id"])
+    id_stage = trace.get("stages", {}).get("identify", {})
+    if id_stage.get("status") == "done":
+        identify_result = id_stage.get("result")
+
+    return render_template("task_detail.html", task=t, identify_result=identify_result)
 
 
 @app.route("/tasks/<task_id>/kill", methods=["POST"])
@@ -401,6 +560,55 @@ def api_cve(cve_id: str):
         return jsonify({"error": "not found"}), 404
     return jsonify(trace)
 
+
+@app.route("/api/cve/<cve_id>/identify")
+def api_cve_identify(cve_id: str):
+    trace = _load_trace(cve_id)
+    id_stage = trace.get("stages", {}).get("identify", {})
+    if id_stage.get("status") != "done":
+        return jsonify({"error": "identify stage not complete"}), 404
+    return jsonify(id_stage.get("result", {}))
+
+
+def _backfill_runs_from_traces() -> None:
+    """Create run entries for CVEs that have trace files but no entry in runs.json.
+
+    Called once at startup so traces produced by CLI runs appear on the dashboard.
+    """
+    if not TRACES_DIR.exists():
+        return
+    existing_cves = {r["cve_id"] for r in _load_runs()}
+    for f in sorted(TRACES_DIR.glob("CVE-*.json")):
+        cve_id = f.stem
+        if cve_id in existing_cves:
+            continue
+        try:
+            trace = json.loads(f.read_text())
+        except Exception:
+            continue
+        stages = trace.get("stages", {})
+        if not stages:
+            continue
+        completed_ats = [
+            s["completed_at"] for s in stages.values()
+            if s.get("status") == "done" and s.get("completed_at")
+        ]
+        started_at = min(completed_ats) if completed_ats else datetime.utcnow().isoformat()
+        ended_at = max(completed_ats) if completed_ats else None
+        blog_path = stages.get("blog", {}).get("result", {}).get("blog_path", "")
+        _append_run({
+            "task_id": f"cli-{cve_id}",
+            "cve_id": cve_id,
+            "cmd": "(CLI run — imported from trace)",
+            "started_at": started_at,
+            "ended_at": ended_at,
+            "status": "done" if ended_at else "unknown",
+            "returncode": 0 if ended_at else None,
+            "blog_path": blog_path,
+        })
+
+
+_backfill_runs_from_traces()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=3011, debug=False, threaded=True)

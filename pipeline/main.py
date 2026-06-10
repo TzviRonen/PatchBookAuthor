@@ -74,8 +74,8 @@ def process_cve(cve: dict, binary_name: str) -> None:
 
     try:
         log.info("[%s] Generating blog post", cve_id)
-        blog_text = generate_blog_post(cve, binary_name, patch_result=patch_result, diff_path=diff_path)
-        blog_path = save_blog_post(blog_text, cve_id, blogs_dir, title=cve.get("title", ""))
+        blog_text, blog_prompt = generate_blog_post(cve, binary_name, patch_result=patch_result, diff_path=diff_path)
+        blog_path = save_blog_post(blog_text, cve_id, blogs_dir, title=cve.get("title", ""), prompt=blog_prompt)
         set_cve_status(cve_id, "done", blog_path=str(blog_path))
         log.info("[%s] Done → %s", cve_id, blog_path)
     except Exception as exc:

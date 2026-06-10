@@ -40,7 +40,7 @@
   </div>
 
   <!-- terminal -->
-  <div class="card">
+  <div class="card" style="margin-bottom:1.25rem;">
     <div class="card-header" style="justify-content:space-between;">
       <h3>
         <span class="status-dot {{ task.status }}" id="dot"></span>
@@ -56,6 +56,132 @@
            style="min-height:400px;max-height:72vh;border:none;border-radius:0 0 8px 8px;overflow-y:auto;"></div>
     </div>
   </div>
+
+  <!-- identifier result -->
+  {% set ir = identify_result %}
+  {% if ir %}
+  <div class="card">
+    <div class="card-header" style="justify-content:space-between;cursor:pointer;" onclick="toggleIdentify()">
+      <h3>Identifier Result <span style="font-weight:400;color:var(--muted);font-size:0.85rem;">— what was passed to the blog generator</span></h3>
+      <span id="identify-toggle-icon" style="font-size:1.1rem;color:var(--muted);">▾</span>
+    </div>
+    <div id="identify-body">
+      <!-- primary patch -->
+      <div style="padding:1.2rem 1.4rem;border-bottom:1px solid var(--border-soft);">
+        <div style="display:flex;align-items:center;gap:0.75rem;flex-wrap:wrap;margin-bottom:0.75rem;">
+          <code style="font-size:1rem;font-weight:700;font-family:var(--font-mono);color:var(--text);">{{ ir.function_name }}</code>
+          <span class="badge green">{{ ir.confidence }}% confidence</span>
+          <span class="badge blue">{{ ir.patch_type }}</span>
+          {% if ir.co_patches %}<span class="badge muted">+ {{ ir.co_patches|length }} co-patch{% if ir.co_patches|length != 1 %}es{% endif %}</span>{% endif %}
+        </div>
+        <p style="color:var(--muted);font-size:0.92rem;margin-bottom:0;">{{ ir.reasoning }}</p>
+      </div>
+
+      <!-- structured fields -->
+      {% if ir.vulnerability_description or ir.fix_description or ir.attack_vector %}
+      <div style="padding:1.1rem 1.4rem;border-bottom:1px solid var(--border-soft);display:grid;gap:1rem;">
+        {% if ir.vulnerability_description %}
+        <div>
+          <div style="font-size:0.78rem;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin-bottom:0.3rem;">Vulnerability</div>
+          <p style="font-size:0.91rem;color:var(--text);margin:0;line-height:1.65;">{{ ir.vulnerability_description }}</p>
+        </div>
+        {% endif %}
+        {% if ir.fix_description %}
+        <div>
+          <div style="font-size:0.78rem;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin-bottom:0.3rem;">Fix</div>
+          <p style="font-size:0.91rem;color:var(--text);margin:0;line-height:1.65;">{{ ir.fix_description }}</p>
+        </div>
+        {% endif %}
+        {% if ir.attack_vector %}
+        <div>
+          <div style="font-size:0.78rem;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin-bottom:0.3rem;">Attack Vector</div>
+          <p style="font-size:0.91rem;color:var(--text);margin:0;line-height:1.65;">{{ ir.attack_vector }}</p>
+        </div>
+        {% endif %}
+      </div>
+      {% endif %}
+
+      <!-- co-patches -->
+      {% if ir.co_patches %}
+      <div style="padding:1rem 1.4rem;border-bottom:1px solid var(--border-soft);">
+        <div style="font-size:0.78rem;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin-bottom:0.6rem;">Co-patches</div>
+        {% for co in ir.co_patches %}
+        <div style="display:flex;align-items:baseline;gap:0.6rem;margin-bottom:0.4rem;flex-wrap:wrap;">
+          <code style="font-family:var(--font-mono);font-size:0.88rem;font-weight:600;">{{ co.name }}</code>
+          <span class="badge muted" style="font-size:0.75rem;">{{ co.confidence }}%</span>
+          <span class="badge blue" style="font-size:0.75rem;">{{ co.patch_type }}</span>
+          <span style="font-size:0.85rem;color:var(--muted);">{{ co.reasoning }}</span>
+        </div>
+        {% endfor %}
+      </div>
+      {% endif %}
+
+      <!-- callers -->
+      {% if ir.callers %}
+      <div style="padding:0.9rem 1.4rem;border-bottom:1px solid var(--border-soft);">
+        <div style="font-size:0.78rem;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin-bottom:0.4rem;">Called by (post-patch)</div>
+        <div style="font-family:var(--font-mono);font-size:0.85rem;color:var(--text);">{{ ir.callers[:10] | join(', ') }}</div>
+      </div>
+      {% endif %}
+
+      <!-- heuristic top candidates -->
+      {% if ir.heuristic_scores %}
+      <details style="border-bottom:1px solid var(--border-soft);">
+        <summary style="padding:0.9rem 1.4rem;cursor:pointer;font-size:0.88rem;font-weight:600;color:var(--muted);list-style:none;display:flex;align-items:center;gap:0.4rem;">
+          <span>▸</span> Heuristic scores (top {{ [ir.heuristic_scores|length, 10]|min }} of {{ ir.heuristic_scores|length }})
+        </summary>
+        <div style="padding:0 0 0.5rem;">
+          <table style="font-size:0.82rem;">
+            <thead><tr><th>#</th><th>Function</th><th>Score</th><th>+/−</th><th>Signals</th></tr></thead>
+            <tbody>
+            {% for h in ir.heuristic_scores[:10] %}
+            <tr>
+              <td style="color:var(--muted2);">{{ h.rank }}</td>
+              <td><code style="font-family:var(--font-mono);font-size:0.82rem;">{{ h.name }}</code></td>
+              <td style="font-weight:600;">{{ h.score|int }}</td>
+              <td style="color:var(--muted2);">+{{ h.added }}/−{{ h.removed }}</td>
+              <td style="color:var(--muted);font-size:0.78rem;">{{ h.reasons[:4]|join(', ') }}</td>
+            </tr>
+            {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      </details>
+      {% endif %}
+
+      <!-- decompiled code -->
+      {% if ir.decompiled_pre or ir.decompiled_post %}
+      <details>
+        <summary style="padding:0.9rem 1.4rem;cursor:pointer;font-size:0.88rem;font-weight:600;color:var(--muted);list-style:none;display:flex;align-items:center;gap:0.4rem;">
+          <span>▸</span> Decompiled code (pre / post)
+        </summary>
+        <div style="padding:0 1.4rem 1.2rem;display:grid;grid-template-columns:1fr 1fr;gap:1rem;">
+          {% if ir.decompiled_pre %}
+          <div>
+            <div style="font-size:0.78rem;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--red);margin-bottom:0.4rem;">Pre-patch (vulnerable)</div>
+            <pre style="background:#1b1f23;border:1px solid #30363d;border-radius:6px;padding:1rem;overflow-x:auto;font-size:0.78rem;color:#c9d1d9;margin:0;max-height:500px;overflow-y:auto;"><code>{{ ir.decompiled_pre }}</code></pre>
+          </div>
+          {% endif %}
+          {% if ir.decompiled_post %}
+          <div>
+            <div style="font-size:0.78rem;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--green);margin-bottom:0.4rem;">Post-patch (fixed)</div>
+            <pre style="background:#1b1f23;border:1px solid #30363d;border-radius:6px;padding:1rem;overflow-x:auto;font-size:0.78rem;color:#c9d1d9;margin:0;max-height:500px;overflow-y:auto;"><code>{{ ir.decompiled_post }}</code></pre>
+          </div>
+          {% endif %}
+        </div>
+      </details>
+      {% endif %}
+
+    </div><!-- /identify-body -->
+  </div>
+  {% elif task.status == 'done' %}
+  <div class="card">
+    <div class="card-body" style="color:var(--muted);font-size:0.9rem;">
+      Identifier result not available — patch identification may have failed or been skipped.
+    </div>
+  </div>
+  {% endif %}
+
 </div>
 {% endblock %}
 {% block scripts %}
@@ -158,6 +284,16 @@ if (STATUS === 'running') {
 } else {
   // Task already finished — stream will replay buffered lines then emit done
   startStream();
+}
+
+/* ── identify result collapse ── */
+function toggleIdentify() {
+  const body = document.getElementById('identify-body');
+  const icon = document.getElementById('identify-toggle-icon');
+  if (!body) return;
+  const hidden = body.style.display === 'none';
+  body.style.display = hidden ? '' : 'none';
+  icon.textContent = hidden ? '▾' : '▸';
 }
 
 /* ── kill ── */

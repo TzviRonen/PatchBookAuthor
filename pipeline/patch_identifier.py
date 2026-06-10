@@ -185,7 +185,8 @@ _BUG_CLASS_KEYWORDS = {
     "race":            ["copy", "capture", "lock", "atomic", "sequence", "stack"],
     "eop":             ["privilege", "token", "access", "check", "elevat", "restrict"],
     "buffer":          ["size", "length", "alloc", "copy", "overflow", "bound", "limit"],
-    "uaf":             ["free", "ref", "count", "release", "dereference", "lifetime"],
+    "uaf":             ["free", "ref", "count", "release", "dereference", "lifetime",
+                        "reference", "lock", "acquire", "spin", "atomic"],
     "null":            ["null", "check", "valid", "deref", "ptr", "pointer"],
     "info_leak":       ["leak", "copy", "write", "output", "disclose"],
     "buffer_over_read": ["read", "size", "length", "bound", "offset", "limit", "cap", "check", "query"],
@@ -198,7 +199,13 @@ _SECURITY_FIX_PATTERNS = re.compile(
     r"|__try|ASSERT\(|STATUS_BUFFER|STATUS_INSUF"
     # info-leak / buffer-over-read patterns
     r"|RtlZeroMemory|memset\s*\(|SecureZeroMemory|RtlSecureZeroMemory"
-    r"|sizeof\s*\(|min\s*\(|_countof\s*\(",
+    r"|sizeof\s*\(|min\s*\(|_countof\s*\("
+    # UAF / reference-counting fix patterns
+    r"|ObReferenceObject|ObDereferenceObject"
+    r"|InterlockedIncrement|InterlockedDecrement"
+    r"|KeAcquireSpinLock|KeReleaseSpinLock|KeAcquireInStackQueuedSpinLock"
+    r"|ExInterlockedIncrement|ExInterlockedDecrement"
+    r"|AddRef\s*\(|Release\s*\(",
     re.IGNORECASE,
 )
 _DEFENSIVE_NAME_PATTERNS = re.compile(r"Check|Validate|Verify|Guard|Probe|Sanitize", re.I)
@@ -242,6 +249,14 @@ def _extract_cve_keywords(cve: dict) -> list[str]:
         # Generic kernel security terms
         expanded += ["security", "attribute", "descriptor", "context", "subject"]
 
+    if ("tcpip" in tl or "tcp/ip" in tl or "network" in tl
+            or "ipv4" in tl or "ipv6" in tl or "routing" in tl
+            or "packet" in tl or "socket" in tl):
+        # tcpip.sys / ndis function naming conventions: protocol, path, route, receive, send
+        expanded += ["receive", "route", "routing", "path", "process", "parse",
+                     "packet", "option", "header", "send", "lookup", "ipv4", "ipv6",
+                     "fragment", "reassemble", "forward", "datagram"]
+
     # Deduplicate preserving insertion order
     seen: set[str] = set()
     result: list[str] = []
@@ -255,10 +270,15 @@ def _extract_cve_keywords(cve: dict) -> list[str]:
 def _detect_bug_class(cve: dict) -> list[str]:
     """Return likely bug class keywords from CVE info."""
     text = f"{cve.get('title', '')} {cve.get('description', '')}".lower()
-    if "time-of-check" in text or "toctou" in text or "race" in text:
-        return _BUG_CLASS_KEYWORDS["toctou"] + _BUG_CLASS_KEYWORDS["race"]
-    if "use after free" in text or "use-after-free" in text:
+    is_race = "time-of-check" in text or "toctou" in text or "race" in text or "concurrent" in text
+    is_uaf = "use after free" in text or "use-after-free" in text
+    if is_uaf:
+        # Race-driven UAF needs both sets so locking/atomic patterns score highly
+        if is_race:
+            return _BUG_CLASS_KEYWORDS["uaf"] + _BUG_CLASS_KEYWORDS["race"]
         return _BUG_CLASS_KEYWORDS["uaf"]
+    if is_race:
+        return _BUG_CLASS_KEYWORDS["toctou"] + _BUG_CLASS_KEYWORDS["race"]
     if "buffer" in text or "overflow" in text:
         return _BUG_CLASS_KEYWORDS["buffer"]
     if "null" in text:
@@ -456,9 +476,15 @@ loop/iteration over the local copy instead of the original pointer.
 - The fix adds a size or bounds check before a copy/allocation.
 - Look for: new `if (size > MAX)`, length validation, RtlSafeAdd*, guarded copy wrapper.
 
-**Use-after-free:**
-- The fix adds a reference count increment before use or a lock around the free path.
-- Look for: ObReferenceObject, ExInterlockedIncrement, new lock acquire before dereference.
+**Use-after-free (including race-driven UAF):**
+- The fix either (a) takes an additional reference before releasing ownership so the object
+  stays alive through subsequent use, (b) moves the release/dereference call to AFTER the
+  last use of the pointer instead of before it, or (c) acquires a lock that serializes access
+  with concurrent cleanup paths (scavenger, flush, interface-state GC).
+- Look for: ObReferenceObject/ObDereferenceObject moved or added, InterlockedIncrement/Decrement
+  added around a dereference site, new KeAcquireSpinLock holding across the use window,
+  a saved local reference taken before the ownership-releasing call, or a NULL check added
+  after a path that could have freed the object concurrently.
 
 **Information Disclosure (Buffer Over-read / Missing Initialisation):**
 - Buffer over-read fix: adds an explicit bounds check before a read/copy, e.g. \
@@ -957,8 +983,10 @@ You have been given:
 
 ## What a security patch looks like
 
-**Use-after-free**: lock acquired around free sequence, missing sub-free calls added,
-reference count added before use.
+**Use-after-free**: additional reference taken before releasing ownership so the object
+stays alive through subsequent use; OR release call moved to after the last pointer use;
+OR lock acquired to serialize with concurrent scavenger/cleanup paths (GC, flush, interface
+teardown) that can concurrently drop the final reference on SMP systems.
 **TOCTOU**: stack-local copy of user pointer before double-use, ProbeForRead added.
 **EoP**: new privilege/token check, new STATUS_ACCESS_DENIED return path.
 **Buffer overflow**: new size/bounds check before copy, RtlSafeAdd*, length cap.
@@ -1126,6 +1154,7 @@ def identify_patch_with_mcp(
     diff_path: Path,
     mcp: "GhidraMCPServer",  # type: ignore[name-defined]
     gather_blog_context: bool = True,
+    allow_web: bool = True,
 ) -> PatchResult:
     """
     Agentic patch identification using live Ghidra tool calls via the MCP bridge.
@@ -1170,8 +1199,9 @@ def identify_patch_with_mcp(
     cve_desc = cve.get("description", "(no description)")
     port = mcp.port
 
+    binary_name = Path(mcp.post).name if mcp.post else "the target binary"
     system_prompt = f"""\
-You are a Windows kernel security researcher identifying which function(s) in ntoskrnl.exe were patched for a CVE.
+You are a Windows kernel security researcher identifying which function(s) in {binary_name} were patched for a CVE.
 
 You have live access to a Ghidra MCP server running locally (port {port}) with two builds loaded:
 - Pre-patch (vulnerable): `{mcp.pre}`
@@ -1198,7 +1228,7 @@ The server was auto-connected when the bridge started — you can immediately us
 
 - **TOCTOU**: stack-local copy of user pointer before double-use, ProbeForRead/ProbeForWrite added, atomic insertion helper added.
 - **EoP**: new privilege/token check, new STATUS_ACCESS_DENIED return path, new access mask validation.
-- **Use-after-free**: lock around free sequence, missing dereference guards added, ref-count check added.
+- **Use-after-free**: additional reference taken before releasing ownership so the object stays alive through later use; OR release call moved to after the last pointer use; OR lock acquired to serialize with concurrent scavenger/cleanup paths that can drop the final ref on SMP systems.
 - **Buffer overflow**: new size/bounds check, RtlSafeAdd*, length cap before RtlCopy*.
 - **Info leak**: RtlZeroMemory added before returning buffer, min() cap on copy size.
 
@@ -1289,15 +1319,19 @@ Investigate the top candidates using the Ghidra tools. Start with decompile_func
     print(f"  [identify/mcp] bridge: {_BRIDGE_SCRIPT.name}  ghidra port: {port}", flush=True)
 
     try:
+        cmd = [
+            "claude", "-p",
+            "--mcp-config", cfg_path,
+            "--system-prompt", system_prompt,
+            "--dangerously-skip-permissions",
+            "--model", CLAUDE_MODEL,
+        ]
+        if not allow_web:
+            cmd += ["--allowedTools", "mcp__ghidra"]
+        cmd.append(user_message)
+
         result = subprocess.run(
-            [
-                "claude", "-p",
-                "--mcp-config", cfg_path,
-                "--system-prompt", system_prompt,
-                "--dangerously-skip-permissions",
-                "--model", CLAUDE_MODEL,
-                user_message,
-            ],
+            cmd,
             capture_output=True,
             text=True,
             timeout=_MCP_SESSION_TIMEOUT,

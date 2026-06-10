@@ -120,7 +120,12 @@
               </div>
               {% endif %}
             {% elif stage == 'blog' %}
-              <a href="/cve/{{ cve_id }}/blog" style="color:var(--blue);">{{ s.result.blog_path.split('/')[-1] if s.result.blog_path else 'view' }}</a>
+              {% set blog_file = s.result.blog_path.split('/')[-1] if s.result.blog_path else '' %}
+              {% if blog_file %}
+              <a href="/blogs/{{ blog_file }}" style="color:var(--blue);">{{ blog_file }}</a>
+              &nbsp;·&nbsp;
+              <a href="/blogs/{{ blog_file }}/prompt" style="color:var(--muted);font-size:0.85rem;">raw prompt →</a>
+              {% endif %}
             {% endif %}
           </div>
           {% endif %}
@@ -173,6 +178,60 @@
         </div>
         {% endfor %}
       </div>
+      {% endif %}
+
+      <!-- structured analysis passed to blog generator -->
+      {% if id_res.vulnerability_description or id_res.fix_description or id_res.attack_vector %}
+      <div style="display:grid;gap:1rem;margin-bottom:1.25rem;padding-top:1.25rem;border-top:1px solid var(--border-soft);">
+        <div style="font-size:0.78rem;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);">Passed to blog generator</div>
+        {% if id_res.vulnerability_description %}
+        <div>
+          <div class="small muted" style="margin-bottom:0.3rem;font-weight:600;">Vulnerability</div>
+          <div style="font-size:0.92rem;line-height:1.7;background:var(--bg2);padding:0.75rem 1rem;border-radius:6px;border-left:3px solid var(--red-border);">{{ id_res.vulnerability_description }}</div>
+        </div>
+        {% endif %}
+        {% if id_res.fix_description %}
+        <div>
+          <div class="small muted" style="margin-bottom:0.3rem;font-weight:600;">Fix</div>
+          <div style="font-size:0.92rem;line-height:1.7;background:var(--bg2);padding:0.75rem 1rem;border-radius:6px;border-left:3px solid var(--green-border);">{{ id_res.fix_description }}</div>
+        </div>
+        {% endif %}
+        {% if id_res.attack_vector %}
+        <div>
+          <div class="small muted" style="margin-bottom:0.3rem;font-weight:600;">Attack Vector</div>
+          <div style="font-size:0.92rem;line-height:1.7;background:var(--bg2);padding:0.75rem 1rem;border-radius:6px;border-left:3px solid var(--orange-border);">{{ id_res.attack_vector }}</div>
+        </div>
+        {% endif %}
+      </div>
+      {% endif %}
+
+      {% if id_res.callers %}
+      <div style="margin-bottom:1.25rem;">
+        <div class="small muted" style="margin-bottom:0.4rem;font-weight:600;">Called by (post-patch)</div>
+        <div class="mono small" style="color:var(--text);">{{ id_res.callers[:10]|join(', ') }}</div>
+      </div>
+      {% endif %}
+
+      {% if id_res.decompiled_pre or id_res.decompiled_post %}
+      <details style="margin-bottom:1rem;">
+        <summary style="cursor:pointer;color:var(--blue);font-size:0.9rem;font-weight:600;list-style:none;margin-bottom:0.5rem;">
+          ▸ Decompiled code (pre / post)
+        </summary>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:1rem;margin-top:0.75rem;">
+          {% if id_res.decompiled_pre %}
+          <div>
+            <div style="font-size:0.75rem;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--red);margin-bottom:0.4rem;">Pre-patch</div>
+            <pre style="background:#1b1f23;border:1px solid #30363d;border-radius:6px;padding:1rem;overflow:auto;font-size:0.78rem;color:#c9d1d9;margin:0;max-height:420px;"><code>{{ id_res.decompiled_pre }}</code></pre>
+          </div>
+          {% endif %}
+          {% if id_res.decompiled_post %}
+          <div>
+            <div style="font-size:0.75rem;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--green);margin-bottom:0.4rem;">Post-patch</div>
+            <pre style="background:#1b1f23;border:1px solid #30363d;border-radius:6px;padding:1rem;overflow:auto;font-size:0.78rem;color:#c9d1d9;margin:0;max-height:420px;"><code>{{ id_res.decompiled_post }}</code></pre>
+          </div>
+          {% endif %}
+        </div>
+      </details>
       {% endif %}
 
       {% if id_res.heuristic_scores %}
