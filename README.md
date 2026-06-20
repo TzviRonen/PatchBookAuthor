@@ -130,6 +130,40 @@ Agent evaluation results are cached per-function in `data/cache/agent_evals/` so
 
 **Blog generation** receives the full decompiled pseudo-C (pre-patch and post-patch) for the primary function and every co-patch, alongside the structured analysis fields from the identify stage and the raw ghidriff diff. This produces deep, code-grounded writeups that quote variable names and control-flow patterns directly from the decompilation.
 
+## PatchBook — public blog
+
+Finished blog posts can be published to [PatchBook](https://github.com/tzvironen/patchbook), a public Jekyll site hosted on GitHub Pages. PatchBook is a git submodule in `patchbook/`.
+
+```bash
+# publish all posts from data/blogs/ to patchbook/_posts/
+python publish_to_patchbook.py
+
+# publish a single CVE
+python publish_to_patchbook.py CVE-2024-30088
+
+# publish and commit in the submodule
+python publish_to_patchbook.py --commit
+```
+
+The script strips the pipeline-generated header, extracts title/CVSS/excerpt metadata, adds Jekyll YAML frontmatter, and writes versioned filenames (`YYYY-MM-DD-cve-XXXX-slug.md`). Pushing the submodule triggers a GitHub Actions workflow that builds and deploys the site.
+
+To preview PatchBook locally:
+
+```bash
+cd patchbook
+bundle install
+bundle exec jekyll serve
+# → http://localhost:4000/patchbook
+```
+
+## Web UI
+
+`web/app.py` is an internal control panel (port 3011) for running the pipeline and reviewing results. Start it with:
+
+```bash
+./start_web.sh
+```
+
 ## Project layout
 
 ```
@@ -144,8 +178,12 @@ pipeline/
   database.py         — SQLite state tracking
   config.py           — environment-based configuration
   main.py             — orchestrator + CLI entry point
+web/app.py            — internal pipeline control panel (Flask, port 3011)
 run_cve.py            — single-CVE runner (development entry point)
 test_pipeline.py      — stage-by-stage test harness
+publish_to_patchbook.py — publish blog posts to PatchBook submodule
+start_web.sh          — start the web UI
+patchbook/            — PatchBook Jekyll site (git submodule, public)
 vendor/ghidra-mcp/    — GhidraMCP server (submodule)
 fixtures/             — cached MSRC API responses
 data/                 — runtime output (gitignored)

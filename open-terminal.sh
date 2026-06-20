@@ -11,6 +11,14 @@ PROJECT_SLUG="${PROJECT_SLUG:-workspace}"
 PROJECT_HASH="$(printf '%s' "$WORKSPACE" | sha256sum | cut -c1-12)"
 IMAGE_NAME="ai-container-${PROJECT_SLUG}-${PROJECT_HASH}"
 CONTAINER_NAME="$IMAGE_NAME"
+SSH_KEY="$HOME/.ssh/ai_container_id_ed25519"
+
+if [[ ! -f "$SSH_KEY" ]]; then
+    echo "[!] SSH key not found: $SSH_KEY"
+    echo "    Git operations inside the container require this key."
+    echo "    Generate it, register the public key with GitHub, then retry."
+    exit 1
+fi
 
 find_free_ports() {
     local count=$1 found=()
@@ -48,13 +56,17 @@ case "$STATE" in
         ;;
     exited|created|paused)
         echo "[*] Starting stopped container '$CONTAINER_NAME'..."
-        docker start "$CONTAINER_NAME"
+        if ! docker start "$CONTAINER_NAME" > /dev/null 2>&1; then
+            echo "[!] Start failed (port conflict). Removing and recreating..."
+            docker rm -f "$CONTAINER_NAME" > /dev/null
+            exec "$0" "$@"
+        fi
         ;;
     missing)
         read -ra FREE_PORTS < <(find_free_ports 3)
         PORT_FLAGS=()
         for p in "${FREE_PORTS[@]}"; do PORT_FLAGS+=(-p "${p}:${p}"); done
-        echo "[*] Creating container '$CONTAINER_NAME'${FREE_PORTS:+ (ports: ${FREE_PORTS[*]})}..."
+        echo "[*] Creating container '$CONTAINER_NAME'..."
         docker run -d \
             --name "$CONTAINER_NAME" \
             --cap-add=SYS_PTRACE \
@@ -64,8 +76,10 @@ case "$STATE" in
             -v "$HOME/.claude:/home/sandbox/.claude" \
             -v "$HOME/.claude.json:/home/sandbox/.claude.json" \
             -v "$HOME/.codex:/home/sandbox/.codex" \
+            -v "$SSH_KEY:/home/sandbox/.ssh/id_ed25519:ro" \
             -e "ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}" \
             -e "OPENAI_API_KEY=${OPENAI_API_KEY:-}" \
+            -e "CONTAINER_PORTS=${FREE_PORTS[*]}" \
             -w /workspace \
             "$IMAGE_NAME" \
             sleep infinity
@@ -77,5 +91,7 @@ case "$STATE" in
         ;;
 esac
 
+ports=$(docker port "$CONTAINER_NAME" 2>/dev/null | awk -F'[/:]' '{print $1}' | sort -nu | tr '\n' ' ')
+[[ -n "$ports" ]] && echo "[*] Forwarded ports: $ports"
 echo "[*] Opening terminal in '$CONTAINER_NAME'..."
 docker exec -it "$CONTAINER_NAME" bash

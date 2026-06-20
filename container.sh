@@ -11,6 +11,7 @@ PROJECT_SLUG="${PROJECT_SLUG:-workspace}"
 PROJECT_HASH="$(printf '%s' "$WORKSPACE" | sha256sum | cut -c1-12)"
 IMAGE_NAME="ai-container-${PROJECT_SLUG}-${PROJECT_HASH}"
 CONTAINER_NAME="$IMAGE_NAME"
+SSH_KEY="$HOME/.ssh/ai_container_id_ed25519"
 
 # ── helpers ────────────────────────────────────────────────────────────────
 
@@ -40,6 +41,12 @@ build_image() {
 }
 
 ensure_running() {
+    if [[ ! -f "$SSH_KEY" ]]; then
+        echo "[!] SSH key not found: $SSH_KEY"
+        echo "    Git operations inside the container require this key."
+        echo "    Generate it, register the public key with GitHub, then retry."
+        exit 1
+    fi
     if ! docker image inspect "$IMAGE_NAME" &>/dev/null; then
         build_image
     fi
@@ -49,13 +56,17 @@ ensure_running() {
         running) ;;
         exited|created|paused)
             echo "[*] Starting container..."
-            docker start "$CONTAINER_NAME" > /dev/null
+            if ! docker start "$CONTAINER_NAME" > /dev/null 2>&1; then
+                echo "[!] Start failed (port conflict). Removing and recreating..."
+                docker rm -f "$CONTAINER_NAME" > /dev/null
+                ensure_running
+            fi
             ;;
         missing)
             read -ra FREE_PORTS < <(find_free_ports 3)
             PORT_FLAGS=()
             for p in "${FREE_PORTS[@]}"; do PORT_FLAGS+=(-p "${p}:${p}"); done
-            echo "[*] Creating container${FREE_PORTS:+ (ports: ${FREE_PORTS[*]})}..."
+            echo "[*] Creating container..."
             docker run -d \
                 --name "$CONTAINER_NAME" \
                 --cap-add=SYS_PTRACE \
@@ -65,8 +76,10 @@ ensure_running() {
                 -v "$HOME/.claude:/home/sandbox/.claude" \
                 -v "$HOME/.claude.json:/home/sandbox/.claude.json" \
                 -v "$HOME/.codex:/home/sandbox/.codex" \
+                -v "$SSH_KEY:/home/sandbox/.ssh/id_ed25519:ro" \
                 -e "ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}" \
                 -e "OPENAI_API_KEY=${OPENAI_API_KEY:-}" \
+                -e "CONTAINER_PORTS=${FREE_PORTS[*]}" \
                 -w /workspace \
                 "$IMAGE_NAME" \
                 sleep infinity > /dev/null
@@ -77,6 +90,35 @@ ensure_running() {
             ensure_running
             ;;
     esac
+}
+
+print_ports() {
+    local ports
+    ports=$(docker port "$CONTAINER_NAME" 2>/dev/null | awk -F'[/:]' '{print $1}' | sort -nu | tr '\n' ' ')
+    [[ -n "$ports" ]] && echo "[*] Forwarded ports: $ports"
+}
+
+cmd_ports() {
+    if [[ -f /.dockerenv ]]; then
+        if [[ -n "${CONTAINER_PORTS:-}" ]]; then
+            echo "[*] Forwarded ports: $CONTAINER_PORTS"
+        else
+            echo "[!] Port info unavailable (container predates this feature)."
+        fi
+    else
+        local state ports
+        state=$(container_state)
+        if [[ "$state" != "running" ]]; then
+            echo "[!] Container is not running (state: $state)."
+            return
+        fi
+        ports=$(docker port "$CONTAINER_NAME" 2>/dev/null | awk -F'[/:]' '{print $1}' | sort -nu | tr '\n' ' ')
+        if [[ -n "$ports" ]]; then
+            echo "[*] Forwarded ports: $ports"
+        else
+            echo "[*] No ports forwarded."
+        fi
+    fi
 }
 
 print_status() {
@@ -90,7 +132,7 @@ print_status() {
 
 # ── commands ───────────────────────────────────────────────────────────────
 
-cmd_start()  { ensure_running; echo "[*] Container is running."; }
+cmd_start()  { ensure_running; print_ports; echo "[*] Container is running."; }
 
 cmd_stop() {
     local state
@@ -106,7 +148,7 @@ cmd_stop() {
     esac
 }
 
-cmd_shell()  { ensure_running; echo "[*] Opening terminal..."; docker exec -it "$CONTAINER_NAME" bash; }
+cmd_shell()  { ensure_running; print_ports; echo "[*] Opening terminal..."; docker exec -it "$CONTAINER_NAME" bash; }
 cmd_status() { echo; print_status; echo; }
 
 cmd_rebuild() {
@@ -133,6 +175,7 @@ interactive_menu() {
         echo "  3) Stop container"
         echo "  4) Rebuild image"
         echo "  5) Show logs"
+        echo "  6) Show forwarded ports"
         echo "  q) Quit"
         echo
         read -rp "  Choice: " choice
@@ -142,6 +185,7 @@ interactive_menu() {
             3) cmd_stop ;;
             4) cmd_rebuild ;;
             5) cmd_logs ;;
+            6) cmd_ports ;;
             q|Q) echo "Bye."; exit 0 ;;
             *) echo "  Unknown option." ;;
         esac
@@ -157,9 +201,10 @@ case "${1:-}" in
     status)  cmd_status ;;
     rebuild) cmd_rebuild ;;
     logs)    cmd_logs ;;
+    ports)   cmd_ports ;;
     "")      interactive_menu ;;
     *)
-        echo "Usage: $0 [start|stop|shell|status|rebuild|logs]"
+        echo "Usage: $0 [start|stop|shell|status|rebuild|logs|ports]"
         echo "       $0          (interactive menu)"
         exit 1
         ;;
