@@ -1,2 +1,6 @@
 .claude/
 
+# secrets / local environment — never commit real keys (ANTHROPIC_API_KEY etc.)
+.env
+.env.*
+!.env.example
