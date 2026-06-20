@@ -66,6 +66,36 @@ def _extract_meta(text: str, stem: str) -> dict:
     return {"cve_id": cve_id, "title": title, "cvss": cvss, "excerpt": excerpt}
 
 
+def _existing_validations(dest: Path) -> list[str]:
+    """Return the `validations:` frontmatter block from an already-published post.
+
+    Community validation marks (added by the GitHub Action, see
+    patchbook/scripts/apply_validation.py) live in the post frontmatter. Re-running
+    publish must not wipe them, so we carry the existing block forward verbatim.
+    Returns the block lines (`validations:` and its indented items) or [].
+    """
+    if not dest.exists():
+        return []
+    lines = dest.read_text(encoding="utf-8").split("\n")
+    if not lines or lines[0].strip() != "---":
+        return []
+    end = next((i for i in range(1, len(lines)) if lines[i].strip() == "---"), None)
+    if end is None:
+        return []
+    fm = lines[1:end]
+    start = next((i for i, l in enumerate(fm) if l.strip() == "validations:"), None)
+    if start is None:
+        return []
+    block = [fm[start]]
+    for l in fm[start + 1:]:
+        # indented list items / mapping entries belong to the block
+        if l[:1] in (" ", "\t") or l.strip().startswith("-"):
+            block.append(l)
+        else:
+            break
+    return block
+
+
 def _post_date(path: Path) -> datetime:
     """Derive date from filename timestamp or file mtime."""
     m = _TS_RE.search(path.stem)
@@ -145,12 +175,16 @@ def publish(filter_cve: str | None = None, do_commit: bool = False) -> None:
         if meta["excerpt"]:
             safe_excerpt = meta["excerpt"].replace('"', "'").replace("\n", " ")
             frontmatter_lines.append(f'excerpt: "{safe_excerpt}"')
-        frontmatter_lines.append("---")
-        frontmatter_lines.append("")
 
         cve_lower = meta["cve_id"].lower() if meta["cve_id"] else ""
         dest_name = f"{date.strftime('%Y-%m-%d')}-{cve_lower}-{_slug(src)}.md"
         dest = POSTS_DIR / dest_name
+
+        # carry forward community validation marks from a prior publish
+        frontmatter_lines.extend(_existing_validations(dest))
+
+        frontmatter_lines.append("---")
+        frontmatter_lines.append("")
         dest.write_text("\n".join(frontmatter_lines) + body, encoding="utf-8")
         print(f"[+] {src.name}  →  patchbook/_posts/{dest_name}")
         published.append(meta["cve_id"] or src.stem)
