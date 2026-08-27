@@ -590,11 +590,12 @@ def _save_eval_cache(cve_id: str, fn_name: str, diff_text: str, result: "AgentEv
 def _call_claude_cli(system_prompt: str, user_message: str, timeout: int = 300,
                      label: str = "") -> str:
     """Call `claude -p` via subprocess and return stdout."""
+    from pipeline.config import CLAUDE_MODEL
     tag = f" [{label}]" if label else ""
     print(f"  → claude{tag}  ({len(user_message)} chars, timeout={timeout}s) ...", flush=True)
     log.info("→ claude -p%s (input=%d chars, timeout=%ds)", tag, len(user_message), timeout)
     result = subprocess.run(
-        ["claude", "-p", "--system-prompt", system_prompt],
+        ["claude", "-p", "--system-prompt", system_prompt, "--model", CLAUDE_MODEL],
         input=user_message,
         capture_output=True,
         text=True,

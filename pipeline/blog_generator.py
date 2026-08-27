@@ -7,7 +7,7 @@ import subprocess
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from pipeline.config import DIFF_INPUT_CHAR_LIMIT
+from pipeline.config import CLAUDE_MODEL, DIFF_INPUT_CHAR_LIMIT
 
 if TYPE_CHECKING:
     from pipeline.patch_identifier import PatchResult
@@ -176,7 +176,7 @@ def generate_blog_post(
              cve["id"], len(user_message))
     print(f"  → claude [blog:{cve['id']}]  ({len(user_message)} chars, timeout=600s) ...", flush=True)
     result = subprocess.run(
-        ["claude", "-p", "--system-prompt", _SYSTEM_PROMPT],
+        ["claude", "-p", "--system-prompt", _SYSTEM_PROMPT, "--model", CLAUDE_MODEL],
         input=user_message,
         capture_output=True,
         text=True,

@@ -12,6 +12,9 @@ PROJECT_HASH="$(printf '%s' "$WORKSPACE" | sha256sum | cut -c1-12)"
 IMAGE_NAME="ai-container-${PROJECT_SLUG}-${PROJECT_HASH}"
 CONTAINER_NAME="$IMAGE_NAME"
 SSH_KEY="$HOME/.ssh/ai_container_id_ed25519"
+GHIDRA_DIR="$HOME/Desktop/ghidra_12.1.2_PUBLIC"
+# Host-side IPs that must stay reachable from inside the container (routed via the host).
+ROUTED_HOSTS=(192.168.10.128)
 
 # ── helpers ────────────────────────────────────────────────────────────────
 
@@ -40,6 +43,25 @@ build_image() {
     docker build -t "$IMAGE_NAME" "$WORKSPACE/.devcontainer"
 }
 
+# Point the container at the host for any IP that lives on a network the docker
+# bridge does not reach on its own (e.g. a VM host-only network).
+ensure_routes() {
+    [[ ${#ROUTED_HOSTS[@]} -eq 0 ]] && return 0
+    local gw
+    gw=$(docker exec "$CONTAINER_NAME" sh -c "ip route show default | awk '{print \$3; exit}'" 2>/dev/null || true)
+    if [[ -z "$gw" ]]; then
+        echo "[!] Could not determine container gateway — skipping host routes."
+        return 0
+    fi
+    for ip in "${ROUTED_HOSTS[@]}"; do
+        if docker exec "$CONTAINER_NAME" ip route replace "$ip/32" via "$gw" 2>/dev/null; then
+            echo "[*] Routed $ip via host ($gw)."
+        else
+            echo "[!] Failed to add route to $ip (needs NET_ADMIN; try './container.sh rebuild' then start)."
+        fi
+    done
+}
+
 ensure_running() {
     if [[ ! -f "$SSH_KEY" ]]; then
         echo "[!] SSH key not found: $SSH_KEY"
@@ -66,10 +88,18 @@ ensure_running() {
             read -ra FREE_PORTS < <(find_free_ports 3)
             PORT_FLAGS=()
             for p in "${FREE_PORTS[@]}"; do PORT_FLAGS+=(-p "${p}:${p}"); done
+            EXTRA_MOUNTS=()
+            if [[ -d "$GHIDRA_DIR" ]]; then
+                EXTRA_MOUNTS+=(-v "$GHIDRA_DIR:/opt/ghidra:ro")
+            else
+                echo "[!] Ghidra not found at $GHIDRA_DIR — skipping /opt/ghidra mount."
+            fi
             echo "[*] Creating container..."
             docker run -d \
                 --name "$CONTAINER_NAME" \
                 --cap-add=SYS_PTRACE \
+                --cap-add=NET_ADMIN \
+                --add-host=host.docker.internal:host-gateway \
                 --security-opt seccomp=unconfined \
                 "${PORT_FLAGS[@]}" \
                 -v "$WORKSPACE:/workspace" \
@@ -77,6 +107,7 @@ ensure_running() {
                 -v "$HOME/.claude.json:/home/sandbox/.claude.json" \
                 -v "$HOME/.codex:/home/sandbox/.codex" \
                 -v "$SSH_KEY:/home/sandbox/.ssh/id_ed25519:ro" \
+                "${EXTRA_MOUNTS[@]}" \
                 -e "ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}" \
                 -e "OPENAI_API_KEY=${OPENAI_API_KEY:-}" \
                 -e "CONTAINER_PORTS=${FREE_PORTS[*]}" \
@@ -88,8 +119,10 @@ ensure_running() {
             echo "[!] Unexpected state '$state'. Removing and recreating..."
             docker rm -f "$CONTAINER_NAME" > /dev/null
             ensure_running
+            return
             ;;
     esac
+    ensure_routes
 }
 
 print_ports() {
