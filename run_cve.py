@@ -153,7 +153,7 @@ TOTAL_STEPS = 6
 
 def run(cve_id: str, update_id: str | None, data_dir: Path, force: bool,
         skip_blog: bool = False, allow_web: bool = True,
-        backend: str = "ghidra", ida_shutdown: bool = True) -> None:
+        backend: str = "ida", ida_shutdown: bool = True) -> None:
     traces_dir = data_dir / "traces"
     trace = Trace(traces_dir / f"{cve_id}.json")
 
@@ -331,6 +331,9 @@ def run(cve_id: str, update_id: str | None, data_dir: Path, force: bool,
                 analysis_backend.start()
             except BackendError as e:
                 _fail(f"{backend} backend unavailable: {e}")
+            except Exception as e:
+                # Any other startup failure is fatal too — do not fall back to Ghidra.
+                _fail(f"{backend} backend failed to start: {e}")
 
         try:
             if analysis_backend:
@@ -479,12 +482,13 @@ def main() -> None:
     parser.add_argument(
         "--backend",
         choices=BACKENDS,
-        default="ghidra",
+        default="ida",
         help=(
-            "Disassembler backend for the identify stage. 'ghidra' (default) uses the "
-            "local headless GhidraMCP server; 'ida' drives IDA Pro on the Windows VM "
-            "over an SSH tunnel (see start_ida_tunnel.sh). Ghidriff still produces the "
-            "diff either way."
+            "Disassembler backend for the identify stage. 'ida' (default) drives IDA "
+            "Pro on the Windows VM over an SSH tunnel (see start_ida_tunnel.sh); if it "
+            "is unavailable the run fails with an error rather than falling back. "
+            "'ghidra' uses the local headless GhidraMCP server. Ghidriff still produces "
+            "the diff either way."
         ),
     )
     parser.add_argument(
