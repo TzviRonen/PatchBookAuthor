@@ -18,7 +18,7 @@ ghidriff_runner.py
   │  runs Ghidra binary diff → ghidriff project (with PDB symbols) + markdown report
   ▼
 patch_identifier.py
-  │  heuristic scoring → Claude agent with Ghidra MCP decompilation → identifies
+  │  heuristic scoring → Claude agent with IDA/Ghidra MCP decompilation → identifies
   │  the patched function, gathers pre/post decompiled code + structured analysis
   ▼
 blog_generator.py
@@ -56,21 +56,38 @@ python3 run_cve.py CVE-2024-30088 --from-stage identify  # re-run identify + blo
 python3 run_cve.py CVE-2024-30088 --from-stage blog      # re-run blog only
 python3 run_cve.py CVE-2024-30088 --update-id 2024-Jun   # skip MSRC search
 python3 run_cve.py CVE-2024-30088 --disable-web          # restrict agent to backend tools only (no internet)
-python3 run_cve.py CVE-2024-30088 --backend ida          # use IDA Pro on the Windows VM instead of Ghidra
+python3 run_cve.py CVE-2024-30088 --backend ghidra       # use local Ghidra instead of the default IDA VM
 python3 run_cve.py https://msrc.microsoft.com/update-guide/vulnerability/CVE-2024-30088
 ```
+
+The default backend is **IDA** (see below). If the IDA VM is unavailable the run fails with an
+error rather than silently falling back — pass `--backend ghidra` to analyse locally.
+
+### Run and publish in one step
+
+`run_and_publish.sh` runs the pipeline for a CVE and then publishes the resulting post to PatchBook.
+Everything before its own flags is forwarded verbatim to `run_cve.py`:
+
+```bash
+./run_and_publish.sh CVE-2026-26179 --from-stage identify        # run + publish
+./run_and_publish.sh CVE-2024-30088 --backend ghidra --publish-commit  # also commit in patchbook/
+./run_and_publish.sh CVE-2024-30088 --skip-publish               # pipeline only
+```
+
+`--publish-commit` and `--skip-publish` are consumed by the wrapper; the CVE id is picked out of the
+arguments (bare id or MSRC URL) for the publish step.
 
 ### Analysis backends
 
 The identify stage drives a disassembler over MCP. `--backend` selects which one; ghidriff still
 produces the binary diff either way.
 
-| | `--backend ghidra` (default) | `--backend ida` |
+| | `--backend ida` (default) | `--backend ghidra` |
 |---|---|---|
-| Server | headless GhidraMCP (Java), started locally | `ida-pro-mcp` inside IDA Pro 9.3 on a Windows VM |
-| Decompiler | Ghidra | Hex-Rays |
-| Programs | one server holds both builds (`program=` argument) | one instance per build, exposed as two MCP servers (`ida_pre` / `ida_post`) |
-| Symbols | from the ghidriff project (PDB-analysed) | from IDA's own PDB download |
+| Server | `ida-pro-mcp` inside IDA Pro 9.3 on a Windows VM | headless GhidraMCP (Java), started locally |
+| Decompiler | Hex-Rays | Ghidra |
+| Programs | one instance per build, exposed as two MCP servers (`ida_pre` / `ida_post`) | one server holds both builds (`program=` argument) |
+| Symbols | from IDA's own PDB download | from the ghidriff project (PDB-analysed) |
 
 Everything backend-specific lives in `pipeline/analysis_backend.py` — the rest of the pipeline never
 names Ghidra or IDA.
@@ -161,14 +178,14 @@ All settings are environment variables with sensible defaults:
 
 **Patch identification** works in three phases:
 1. Heuristic scoring ranks all changed functions by CVE keyword overlap, change size, and security patterns — no LLM calls.
-2. A Claude agent evaluates the top candidates one at a time (300s timeout per call) using a [GhidraMCP](https://github.com/LaurieWired/GhidraMCP) server for on-demand decompilation. The server opens the pre-analyzed ghidriff Ghidra project (which includes PDB symbols) so every function decompiles to named, readable pseudo-C. The agent stops at the first function with ≥75% confidence and records a structured verdict (`vulnerability_description`, `fix_description`, `attack_vector`). After the primary patch is found, remaining high-scoring candidates are evaluated for co-patches.
+2. A Claude agent evaluates the top candidates one at a time (300s timeout per call) using the selected backend's MCP server for on-demand decompilation (Hex-Rays under the default IDA backend, or a GhidraMCP server opening the pre-analyzed ghidriff project under `--backend ghidra`). Either way every function decompiles to named, readable pseudo-C from PDB symbols. The agent stops at the first function with ≥75% confidence and records a structured verdict (`vulnerability_description`, `fix_description`, `attack_vector`). After the primary patch is found, remaining high-scoring candidates are evaluated for co-patches.
 3. After the verdict, `_gather_mcp_context` decompiles the primary function and all co-patches (pre + post binary) while the MCP server is still running, building a rich context block for the blog stage.
 
-By default the MCP identify agent has full internet access, which lets it consult external resources and existing writeups. Pass `--disable-web` to restrict it to the selected backend's tools only (`--allowedTools mcp__ghidra`, or `mcp__ida_pre,mcp__ida_post` under `--backend ida`), ensuring the analysis is derived solely from the binary diff and decompilation.
+By default the MCP identify agent has internet access (`WebSearch`/`WebFetch`), which lets it consult external resources. Pass `--disable-web` to restrict it to the selected backend's tools only (`mcp__ida_pre,mcp__ida_post`, or `mcp__ghidra` under `--backend ghidra`), so the analysis derives solely from the binary diff and decompilation. In **both** modes the agent is denied local filesystem/shell tools (`Read`, `Grep`, `Bash`, …) so it cannot read the repo's own prior posts or cached verdicts and launder them back in as fresh analysis — its only inputs are MCP decompilation, the inline diff, and (unless `--disable-web`) web search. The same denial applies to the blog agent.
 
 Agent evaluation results are cached per-function in `data/cache/agent_evals/` so re-runs don't re-evaluate already-seen functions.
 
-**Blog generation** receives the full decompiled pseudo-C (pre-patch and post-patch) for the primary function and every co-patch, alongside the structured analysis fields from the identify stage and the raw ghidriff diff. This produces deep, code-grounded writeups that quote variable names and control-flow patterns directly from the decompilation.
+**Blog generation** receives the full decompiled pseudo-C (pre-patch and post-patch) for the primary function and every co-patch, alongside the structured analysis fields from the identify stage and the raw ghidriff diff. This produces deep, code-grounded writeups that quote variable names and control-flow patterns directly from the decompilation. Every post follows a fixed skeleton (`TL;DR`, `Background`, `Root Cause`, `The Patch`, `Exploitability`) with a title of the form `CVE-YYYY-NNNNN: <bug class in component>`, and a deterministic metadata box (affected binary + version transition, CVE, CVSS, class, patch KB) is inserted directly under the title. The model also emits a machine-readable `<!--meta-->` block carrying the title and excerpt so publishing does not have to scrape them.
 
 ## PatchBook — public blog
 
@@ -185,7 +202,7 @@ python publish_to_patchbook.py CVE-2024-30088
 python publish_to_patchbook.py --commit
 ```
 
-The script strips the pipeline-generated header, extracts title/CVSS/excerpt metadata, adds Jekyll YAML frontmatter, and writes versioned filenames (`YYYY-MM-DD-cve-XXXX-slug.md`). Pushing the submodule triggers a GitHub Actions workflow that builds and deploys the site.
+The script strips the pipeline-generated header and the `<!--meta-->` block, reads the title/excerpt from that block (falling back to scraping the body for older posts), extracts the CVSS, adds Jekyll YAML frontmatter, and writes dated filenames (`YYYY-MM-DD-cve-XXXX-slug.md`). When a CVE has several generations in `data/blogs/`, the **newest** one is published, so regenerating a post and re-publishing supersedes the previous version. Pushing the submodule triggers a GitHub Actions workflow that builds and deploys the site.
 
 To preview PatchBook locally:
 
