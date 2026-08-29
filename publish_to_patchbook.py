@@ -25,6 +25,28 @@ _CVE_RE    = re.compile(r"^(CVE-\d{4}-\d+)", re.IGNORECASE)
 _TITLE_RE  = re.compile(r"^# (.+)$", re.MULTILINE)
 _CVSS_RE   = re.compile(r"CVSS[^0-9]*([\d]+\.[0-9])")
 _TS_RE     = re.compile(r"_(\d{8}T\d{6})$")  # stem suffix like _20260610T205532
+# Machine-readable block the blog generator emits at the very top of the post:
+#   <!--meta
+#   title: ...
+#   excerpt: ...
+#   -->
+_META_RE   = re.compile(r"<!--\s*meta\s*\n(.*?)\n\s*-->", re.DOTALL | re.IGNORECASE)
+
+
+def _parse_meta_block(text: str) -> dict:
+    """Parse the `<!--meta ... -->` block if present. Returns {} when absent."""
+    m = _META_RE.search(text)
+    if not m:
+        return {}
+    out: dict = {}
+    for line in m.group(1).splitlines():
+        if ":" not in line:
+            continue
+        key, _, val = line.partition(":")
+        key = key.strip().lower()
+        if key in ("title", "excerpt") and val.strip():
+            out[key] = val.strip()
+    return out
 
 
 def _extract_meta(text: str, stem: str) -> dict:
@@ -36,32 +58,38 @@ def _extract_meta(text: str, stem: str) -> dict:
     # strip the pipeline header before looking for title
     body = _HEADER_RE.sub("", text, count=1).lstrip()
 
-    title = ""
-    for m in _TITLE_RE.finditer(body):
-        candidate = m.group(1).strip()
-        # skip bare "CVE-XXXX-NNNNN" headings (pipeline artifact)
-        if not re.fullmatch(r"CVE-[\w-]+", candidate, re.IGNORECASE):
-            title = candidate
-            break
+    # Prefer the explicit metadata block the generator emits; fall back to scraping.
+    meta = _parse_meta_block(text)
+
+    title = meta.get("title", "")
+    if not title:
+        for m in _TITLE_RE.finditer(body):
+            candidate = m.group(1).strip()
+            # skip bare "CVE-XXXX-NNNNN" headings (pipeline artifact)
+            if not re.fullmatch(r"CVE-[\w-]+", candidate, re.IGNORECASE):
+                title = candidate
+                break
 
     cvss = ""
     m = _CVSS_RE.search(body[:600])
     if m:
         cvss = m.group(1)
 
-    # excerpt: first paragraph longer than 60 chars that isn't a heading or code block
-    excerpt = ""
-    for para in body.split("\n\n"):
-        stripped = para.strip()
-        if stripped.startswith("#") or stripped.startswith("```") or stripped.startswith("|"):
-            continue
-        # skip the "**CVE-XXXX** | CVSS ... | binary" metadata line
-        if stripped.startswith("**CVE-") and "|" in stripped:
-            continue
-        if stripped == "---" or len(stripped) < 60:
-            continue
-        excerpt = stripped[:240]
-        break
+    excerpt = meta.get("excerpt", "")
+    if not excerpt:
+        # first paragraph longer than 60 chars that isn't a heading or code block
+        for para in body.split("\n\n"):
+            stripped = para.strip()
+            if stripped.startswith("#") or stripped.startswith("```") or stripped.startswith("|"):
+                continue
+            # skip the "**CVE-XXXX** | CVSS ... | binary" metadata line
+            if stripped.startswith("**CVE-") and "|" in stripped:
+                continue
+            if stripped == "---" or len(stripped) < 60:
+                continue
+            excerpt = stripped
+            break
+    excerpt = excerpt[:300]
 
     return {"cve_id": cve_id, "title": title, "cvss": cvss, "excerpt": excerpt}
 
@@ -126,9 +154,13 @@ def _select_posts(filter_cve: str | None) -> list[Path]:
 
     selected = []
     for cve, files in groups.items():
-        # prefer file whose stem has no timestamp suffix
-        base = [f for f in files if not _TS_RE.search(f.stem)]
-        selected.append(base[0] if base else files[0])
+        # Publish the newest generation for each CVE. Regenerating a post writes a
+        # fresh timestamped file (save_blog_post only reuses the bare name for the
+        # very first run), so the latest regeneration must win — otherwise publish
+        # would keep re-selecting the stale original base file. Tie-break on the
+        # bare (timestamp-less) name so a lone first-run file still selects.
+        newest = max(files, key=lambda f: (_post_date(f), bool(_TS_RE.search(f.stem))))
+        selected.append(newest)
 
     return selected
 
@@ -159,8 +191,9 @@ def publish(filter_cve: str | None = None, do_commit: bool = False) -> None:
             print(f"[!] Could not extract title from {src.name}, skipping.")
             continue
 
-        # strip the pipeline header; keep everything after it
-        body = _HEADER_RE.sub("", text, count=1).lstrip()
+        # strip the pipeline header and the machine-readable meta block; keep the rest
+        body = _HEADER_RE.sub("", text, count=1)
+        body = _META_RE.sub("", body, count=1).lstrip()
 
         frontmatter_lines = [
             "---",

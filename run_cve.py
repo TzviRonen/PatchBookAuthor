@@ -25,6 +25,7 @@ from pipeline.kernel_filter import classify_cve
 from pipeline.winbindex import get_binary_pair
 from pipeline.ghidriff_runner import run_ghidriff
 from pipeline.patch_identifier import identify_patch, PatchNotFoundError
+from pipeline.analysis_backend import BACKENDS, BackendError, make_backend
 from pipeline.blog_generator import generate_blog_post, save_blog_post
 
 # ── logging ────────────────────────────────────────────────────────────────────
@@ -151,7 +152,8 @@ TOTAL_STEPS = 6
 
 
 def run(cve_id: str, update_id: str | None, data_dir: Path, force: bool,
-        skip_blog: bool = False, allow_web: bool = True) -> None:
+        skip_blog: bool = False, allow_web: bool = True,
+        backend: str = "ghidra", ida_shutdown: bool = True) -> None:
     traces_dir = data_dir / "traces"
     trace = Trace(traces_dir / f"{cve_id}.json")
 
@@ -220,17 +222,23 @@ def run(cve_id: str, update_id: str | None, data_dir: Path, force: bool,
             "pre_build": pre_build, "post_build": post_build,
         })
 
+    # Build numbers, needed by the blog metadata box. Derived from the file
+    # suffix so both the cached and freshly-downloaded paths agree.
+    pre_build = int(pre_path.suffix.lstrip("."))
+    post_build = int(post_path.suffix.lstrip("."))
+
     # ── Step 3: Ghidriff (+ concurrent MCP server startup) ────────────────────
     _print(3, TOTAL_STEPS, "Running ghidriff (20-40 min)...")
 
     mcp_server = None
+    want_ghidra_mcp = backend == "ghidra"
     cached = trace.get("ghidriff")
     if cached:
         diff_path = Path(cached["diff_path"])
         _print(3, TOTAL_STEPS, "Ghidriff (cached)",
                f"{cached['function_count']} changed functions")
         # Diff is cached — still start MCP if identify stage will need it
-        if not trace.get("identify"):
+        if want_ghidra_mcp and not trace.get("identify"):
             from pipeline.ghidriff_runner import _start_mcp_background, _GHIDRA_PROJECTS_DIR
             _base = f"ghidriff_{cve_id.replace('/', '-')}"
             _proj_name = f"{_base}-{pre_path.name}-{post_path.name}"
@@ -249,7 +257,8 @@ def run(cve_id: str, update_id: str | None, data_dir: Path, force: bool,
         diffs_dir = data_dir / "diffs"
         diff_name = cve_id.replace("/", "-")
         try:
-            diff_path, mcp_server = run_ghidriff(pre_path, post_path, diffs_dir, diff_name)
+            diff_path, mcp_server = run_ghidriff(pre_path, post_path, diffs_dir, diff_name,
+                                                 start_mcp=want_ghidra_mcp)
         except Exception as e:
             _fail(f"Ghidriff failed: {e}")
 
@@ -297,25 +306,36 @@ def run(cve_id: str, update_id: str | None, data_dir: Path, force: bool,
             mcp_server.stop()
             mcp_server = None
     else:
-        # Wait for MCP server to finish starting (ran concurrently with ghidriff)
-        mcp_ready = False
-        if mcp_server:
-            ready_event = getattr(mcp_server, "_ready_event", None)
-            start_error = getattr(mcp_server, "_start_error", [])
-            if ready_event:
-                print("  [mcp] waiting for MCP server to be ready ...", flush=True)
-                ready_event.wait()
-            if start_error:
-                print(f"  [mcp] WARNING: MCP server failed ({start_error[0]}) — "
-                      "falling back to one-shot identify", flush=True)
-                mcp_server = None
-            elif mcp_server.pre and mcp_server.post:
-                mcp_ready = True
+        analysis_backend = None
+        if backend == "ghidra":
+            # Wait for MCP server to finish starting (ran concurrently with ghidriff)
+            if mcp_server:
+                ready_event = getattr(mcp_server, "_ready_event", None)
+                start_error = getattr(mcp_server, "_start_error", [])
+                if ready_event:
+                    print("  [mcp] waiting for MCP server to be ready ...", flush=True)
+                    ready_event.wait()
+                if start_error:
+                    print(f"  [mcp] WARNING: MCP server failed ({start_error[0]}) — "
+                          "falling back to one-shot identify", flush=True)
+                    mcp_server = None
+                elif mcp_server.pre and mcp_server.post:
+                    analysis_backend = make_backend("ghidra", ghidra_server=mcp_server)
+        else:
+            # IDA owns its own startup: upload, launch on the VM, open tunnels.
+            try:
+                analysis_backend = make_backend(
+                    backend, pre_binary=pre_path, post_binary=post_path, cve_id=cve_id,
+                    ida_shutdown=ida_shutdown,
+                )
+                analysis_backend.start()
+            except BackendError as e:
+                _fail(f"{backend} backend unavailable: {e}")
 
         try:
-            if mcp_ready and mcp_server:
+            if analysis_backend:
                 from pipeline.patch_identifier import identify_patch_with_mcp
-                patch_result = identify_patch_with_mcp(cve, diff_path, mcp_server,
+                patch_result = identify_patch_with_mcp(cve, diff_path, analysis_backend,
                                                        allow_web=allow_web)
             else:
                 patch_result = identify_patch(cve, diff_path)
@@ -349,9 +369,14 @@ def run(cve_id: str, update_id: str | None, data_dir: Path, force: bool,
         except Exception as e:
             print(f"       WARNING: patch identification error: {e} — falling back to full diff")
         finally:
-            if mcp_server:
+            # Ghidra: shuts the Java server down. IDA: tears down the SSH
+            # tunnels but deliberately leaves the VM instances running so the
+            # next run can reuse the analysed databases.
+            if analysis_backend:
+                analysis_backend.stop()
+            elif mcp_server:
                 mcp_server.stop()
-                mcp_server = None
+            mcp_server = None
 
     # ── Step 5: Generate blog post ─────────────────────────────────────────────
     if skip_blog:
@@ -379,6 +404,7 @@ def run(cve_id: str, update_id: str | None, data_dir: Path, force: bool,
                 cve, binary_name,
                 patch_result=patch_result,
                 diff_path=diff_path if patch_result is None else None,
+                versions={"pre_build": pre_build, "post_build": post_build},
             )
         except Exception as e:
             _fail(f"Blog generation failed: {e}")
@@ -445,9 +471,31 @@ def main() -> None:
         action="store_true",
         default=False,
         help=(
-            "Restrict the MCP identify agent to Ghidra tools only, blocking internet "
-            "access. By default the agent can also use built-in tools (Bash, Read, etc.) "
-            "which allows it to consult external resources."
+            "Restrict the MCP identify agent to the analysis backend's tools only, "
+            "blocking internet access. By default the agent can also use built-in tools "
+            "(Bash, Read, etc.) which allows it to consult external resources."
+        ),
+    )
+    parser.add_argument(
+        "--backend",
+        choices=BACKENDS,
+        default="ghidra",
+        help=(
+            "Disassembler backend for the identify stage. 'ghidra' (default) uses the "
+            "local headless GhidraMCP server; 'ida' drives IDA Pro on the Windows VM "
+            "over an SSH tunnel (see start_ida_tunnel.sh). Ghidriff still produces the "
+            "diff either way."
+        ),
+    )
+    parser.add_argument(
+        "--no-ida-shutdown",
+        dest="ida_shutdown",
+        action="store_false",
+        default=True,
+        help=(
+            "For --backend ida: leave the IDA instances running on the VM after the "
+            "identify stage so a later run can reuse the warm databases. By default "
+            "IDA is closed once the stage finishes. The .i64 is saved either way."
         ),
     )
     args = parser.parse_args()
@@ -467,7 +515,8 @@ def main() -> None:
         print(f"  Cleared stages from '{args.from_stage}' onwards.\n")
 
     run(cve_id, args.update_id, data_dir, force=args.force, skip_blog=args.skip_blog,
-        allow_web=not args.disable_web)
+        allow_web=not args.disable_web, backend=args.backend,
+        ida_shutdown=args.ida_shutdown)
 
 
 if __name__ == "__main__":

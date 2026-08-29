@@ -7,42 +7,149 @@ import subprocess
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from pipeline.config import CLAUDE_MODEL, DIFF_INPUT_CHAR_LIMIT
+from pipeline.config import CLAUDE_MODEL, DIFF_INPUT_CHAR_LIMIT, TARGET_WINDOWS_BUILD
 
 if TYPE_CHECKING:
     from pipeline.patch_identifier import PatchResult
 
 log = logging.getLogger(__name__)
 
+# The blog agent writes prose from the context it is handed; it must not read local
+# files. The pipeline runs from the repo root, which holds this CVE's own prior posts
+# (patchbook/_posts/, data/blogs/), so allowing filesystem tools would let the model
+# recycle an earlier writeup instead of working from the supplied decompilation.
+_DENY_LOCAL_TOOLS = ["Read", "Edit", "Write", "NotebookEdit", "Glob", "Grep", "Bash", "Task"]
+
 _SYSTEM_PROMPT = """\
 You are a Windows kernel security researcher and technical writer with deep expertise in \
 low-level Windows internals, exploit development, and binary patch analysis.
 
 Your job is to write an in-depth technical blog post for a security research audience. \
-You will be given: the CVE metadata, a structured analysis from a Ghidra investigation \
+You will be given: the CVE metadata, a structured analysis of the patched functions \
 (vulnerability description, fix description, attack vector), the actual decompiled pseudo-C \
-for the patched functions (pre-patch and post-patch), and the ghidriff binary diff.
+for the patched functions (pre-patch and post-patch), and the binary diff.
 
-Cover:
+## Output format
 
-1. **What the bug was** — the exact root cause, the kernel code path, and the specific \
-operations that created the vulnerability. Use the decompiled code as primary evidence: \
-quote variable names, pointer arithmetic, and control-flow patterns directly.
+Begin your response with a metadata block, exactly in this form and nothing before it:
 
-2. **What the patch did** — walk through every changed function. Explain each added check, \
-new helper, restructured pointer operation, or probe. Show the before/after using the \
-decompiled code and diff together.
+<!--meta
+title: <the post title — see rules below>
+excerpt: <one or two plain-text sentences, no Markdown, no code, that state the affected \
+component, the bug class, and the impact; 200-300 characters>
+-->
 
-3. **How it could be exploited** — describe the attack primitive an adversary obtains \
-(arbitrary write, info-leak, UAF, etc.), the race window or trigger condition, and \
-why it is practically reachable despite the complexity rating.
+Immediately after the block, write the post. Start with an H1 that repeats the title \
+(`# <title>`), then the sections below.
 
-Write in an authoritative but conversational style. Use Markdown with clear section headers. \
-Do not pad or repeat yourself — every paragraph should add new technical information. \
-Do not include a "lessons" or "takeaways" section. \
-Assume the reader understands C, Windows kernel architecture, and common vulnerability classes \
-but may not be familiar with this specific subsystem.\
+A metadata box (affected binary + version transition, CVE, CVSS, class, patch KB) is \
+inserted automatically right under the H1 — do **not** write your own summary table, \
+metadata list, or "affected binary / CVSS / KB" line. Begin directly with `## TL;DR`.
+
+### Title rules
+
+- Format: `CVE-YYYY-NNNNN: <Concise Technical Description>`.
+- The description names the **bug class** and the **component or function** it lives in, \
+e.g. `Use-After-Free in the Windows IPv4 Source-Routing Path`.
+- Title Case, no trailing period, at most ~80 characters after the colon.
+- Prefer the precise vulnerability class (Use-After-Free, Out-of-Bounds Write, Type \
+Confusion, Race Condition, Integer Overflow, Info Leak) over the generic MSRC category.
+
+### Required sections (use these exact H2 headings, in this order)
+
+1. `## TL;DR` — 3-6 sentences: the subsystem, the root cause, the primitive an attacker \
+gains, and what the patch changed. Someone should be able to read only this and understand \
+the bug.
+2. `## Background` — the subsystem, data structures, and code path a reader needs before \
+the bug makes sense. Keep it tight and specific to this vulnerability.
+3. `## Root Cause` — the exact defect. Use the pre-patch decompiled code as primary \
+evidence: quote variable names, pointer arithmetic, reference-count and locking patterns, \
+and control flow directly.
+4. `## The Patch` — walk through every changed function. Explain each added check, new \
+helper, restructured operation, or probe, showing before/after from the decompiled code and \
+diff together. Note any `Feature_*` gating.
+5. `## Exploitability` — the attack primitive obtained (arbitrary write, info-leak, UAF, \
+etc.), the trigger condition or race window, reachability (local vs remote, required \
+privileges), and why it is practical despite the complexity rating.
+
+You may add further H2 sections after these if the material warrants (e.g. \
+`## Affected Versions`, `## Detection`), but the five above are mandatory and must appear \
+in that order.
+
+## Style
+
+Write in an authoritative but conversational style. Every paragraph must add new technical \
+information — do not pad or repeat yourself. Do not include a "lessons", "takeaways", or \
+"conclusion" section. Assume the reader understands C, Windows kernel architecture, and \
+common vulnerability classes but may not be familiar with this specific subsystem.\
 """
+
+
+_PATCH_TYPE_LABELS = {
+    "TOCTOU": "TOCTOU race condition",
+    "EoP": "Elevation of privilege",
+    "buffer_overflow": "Buffer overflow",
+    "use_after_free": "Use-after-free",
+    "null_deref": "Null-pointer dereference",
+    "info_leak": "Information disclosure",
+    "other": "",
+}
+
+
+def _metadata_box(
+    cve: dict,
+    binary_name: str,
+    patch_result: "PatchResult | None",
+    versions: dict | None,
+) -> str:
+    """Build the deterministic metadata block shown at the top of every post.
+
+    Assembled from pipeline data (not the LLM) so it is present and consistent in
+    every post regardless of what the model chooses to write.
+    """
+    lines: list[str] = []
+
+    if versions and versions.get("pre_build") and versions.get("post_build"):
+        pre = f"10.0.{TARGET_WINDOWS_BUILD}.{versions['pre_build']}"
+        post = f"10.0.{TARGET_WINDOWS_BUILD}.{versions['post_build']}"
+        lines.append(f"- **Affected binary:** `{binary_name}` {pre} → {post}")
+    elif binary_name:
+        lines.append(f"- **Affected binary:** `{binary_name}`")
+
+    lines.append(f"- **CVE:** {cve['id']}")
+
+    if cve.get("cvss"):
+        lines.append(f"- **CVSS:** {cve['cvss']}")
+
+    if patch_result is not None:
+        label = _PATCH_TYPE_LABELS.get(patch_result.patch_type, "")
+        if label:
+            lines.append(f"- **Class:** {label}")
+
+    kbs = [kb for kb in cve.get("kb_numbers", []) if kb]
+    if kbs:
+        kb_str = kbs[0] if len(kbs) == 1 else f"{kbs[0]} and related"
+        lines.append(f"- **Patch KB:** {kb_str}")
+
+    return "\n".join(lines)
+
+
+def _prepend_metadata_box(blog_text: str, box: str) -> str:
+    """Insert *box* immediately after the post's first H1 heading.
+
+    Falls back to prepending if the model produced no H1.
+    """
+    if not box:
+        return blog_text
+    lines = blog_text.split("\n")
+    for i, line in enumerate(lines):
+        if line.startswith("# "):
+            rest = lines[i + 1:]
+            # skip any blank lines right after the H1 so the box sits flush under it
+            while rest and not rest[0].strip():
+                rest = rest[1:]
+            return "\n".join(lines[: i + 1] + ["", box, ""] + rest)
+    return box + "\n\n" + blog_text
 
 
 def _truncate_diff(diff_text: str, char_limit: int) -> str:
@@ -84,6 +191,7 @@ def generate_blog_post(
     binary_name: str,
     patch_result: "PatchResult | None" = None,
     diff_path: "Path | None" = None,
+    versions: dict | None = None,
 ) -> str:
     """Call Claude to generate a blog post and return the Markdown text.
 
@@ -176,7 +284,8 @@ def generate_blog_post(
              cve["id"], len(user_message))
     print(f"  → claude [blog:{cve['id']}]  ({len(user_message)} chars, timeout=600s) ...", flush=True)
     result = subprocess.run(
-        ["claude", "-p", "--system-prompt", _SYSTEM_PROMPT, "--model", CLAUDE_MODEL],
+        ["claude", "-p", "--system-prompt", _SYSTEM_PROMPT, "--model", CLAUDE_MODEL,
+         "--disallowedTools", ",".join(_DENY_LOCAL_TOOLS)],
         input=user_message,
         capture_output=True,
         text=True,
@@ -193,6 +302,9 @@ def generate_blog_post(
     blog_text = result.stdout.strip()
     if not blog_text:
         raise RuntimeError("Claude CLI returned an empty response")
+
+    box = _metadata_box(cve, binary_name, patch_result, versions)
+    blog_text = _prepend_metadata_box(blog_text, box)
 
     return blog_text, user_message
 

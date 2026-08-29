@@ -595,7 +595,8 @@ def _call_claude_cli(system_prompt: str, user_message: str, timeout: int = 300,
     print(f"  → claude{tag}  ({len(user_message)} chars, timeout={timeout}s) ...", flush=True)
     log.info("→ claude -p%s (input=%d chars, timeout=%ds)", tag, len(user_message), timeout)
     result = subprocess.run(
-        ["claude", "-p", "--system-prompt", system_prompt, "--model", CLAUDE_MODEL],
+        ["claude", "-p", "--system-prompt", system_prompt, "--model", CLAUDE_MODEL,
+         "--disallowedTools", ",".join(_DENY_LOCAL_TOOLS)],
         input=user_message,
         capture_output=True,
         text=True,
@@ -1147,32 +1148,35 @@ _MCP_TOOLS: list[dict] = [
 
 _MCP_SESSION_TIMEOUT = 600   # seconds for the full agentic claude -p session
 
-_BRIDGE_SCRIPT = Path(__file__).parent.parent / "vendor" / "ghidra-mcp" / "bridge_mcp_ghidra.py"
+# Local filesystem / shell tools are always denied to the identify and blog agents.
+# The pipeline runs from the repo root, which contains this CVE's own prior writeups
+# (patchbook/_posts/, data/blogs/) and cached verdicts (data/cache/). With
+# --dangerously-skip-permissions the agent could otherwise Read/Grep/Bash those and
+# launder its previous conclusion back in as "analysis". The agent's legitimate inputs
+# are the MCP decompiler and (when allow_web) web search — never local files.
+_DENY_LOCAL_TOOLS = ["Read", "Edit", "Write", "NotebookEdit", "Glob", "Grep", "Bash", "Task"]
+
 
 
 def identify_patch_with_mcp(
     cve: dict,
     diff_path: Path,
-    mcp: "GhidraMCPServer",  # type: ignore[name-defined]
+    backend: "AnalysisBackend",  # type: ignore[name-defined]
     gather_blog_context: bool = True,
     allow_web: bool = True,
 ) -> PatchResult:
     """
-    Agentic patch identification using live Ghidra tool calls via the MCP bridge.
+    Agentic patch identification using live disassembler tool calls over MCP.
 
-    Starts the bethington/ghidra-mcp bridge as an MCP stdio server and passes
-    it to `claude -p --mcp-config`, giving Claude native tool-calling access to
-    both binaries (decompile, xrefs, callers, search).  Works with OAuth auth
-    (no ANTHROPIC_API_KEY required).
+    Hands the backend's MCP server config to `claude -p --mcp-config`, giving
+    Claude native tool-calling access to both binaries (decompile, xrefs,
+    callers, search).  Works with OAuth auth (no ANTHROPIC_API_KEY required).
+
+    `backend` is an `AnalysisBackend` (Ghidra or IDA) — see
+    pipeline/analysis_backend.py. Nothing below this point is backend-specific.
     """
     import tempfile
     from pipeline.config import CLAUDE_MODEL
-
-    if not _BRIDGE_SCRIPT.exists():
-        raise RuntimeError(
-            f"MCP bridge not found at {_BRIDGE_SCRIPT}. "
-            "Clone vendor/ghidra-mcp and ensure bridge_mcp_ghidra.py is present."
-        )
 
     sections = parse_ghidriff_sections(diff_path)
     if not sections:
@@ -1198,32 +1202,12 @@ def identify_patch_with_mcp(
 
     cve_id = cve.get("id", "unknown")
     cve_desc = cve.get("description", "(no description)")
-    port = mcp.port
 
-    binary_name = Path(mcp.post).name if mcp.post else "the target binary"
+    binary_name = backend.binary_name
     system_prompt = f"""\
 You are a Windows kernel security researcher identifying which function(s) in {binary_name} were patched for a CVE.
 
-You have live access to a Ghidra MCP server running locally (port {port}) with two builds loaded:
-- Pre-patch (vulnerable): `{mcp.pre}`
-- Post-patch (fixed): `{mcp.post}`
-
-The server was auto-connected when the bridge started — you can immediately use Ghidra tools without calling connect_instance.
-
-## Key tools
-
-- `decompile_function(address=FUNC_NAME, program=PROGRAM_NAME)` — decompile pseudo-C from either binary.  Use `program="{mcp.pre}"` for the vulnerable version, `program="{mcp.post}"` for the fixed version.
-- `search_functions(name_pattern=SUBSTRING, program=PROGRAM_NAME)` — find functions by name pattern.
-- `get_function_callers(name=FUNC_NAME, program=PROGRAM_NAME)` — what calls this function.
-- `get_function_callees(name=FUNC_NAME, program=PROGRAM_NAME)` — what this function calls.
-- `list_open_programs()` — confirm which programs are loaded.
-
-## Investigation strategy
-
-1. Start by decompiling the #1 heuristic candidate in BOTH binaries (pre and post) to see the change.
-2. Check callers to determine if this is the outermost changed function or a callee updated as a side effect.
-3. If the top candidate doesn't fit the CVE, try the next candidates.
-4. Use search_functions to find related functions by name pattern if needed.
+{backend.tool_docs()}
 
 ## What security patches look like
 
@@ -1292,32 +1276,20 @@ Full candidate list ({len(candidates)} total):
     for e in heuristic_log[10:]
 )}
 
-Investigate the top candidates using the Ghidra tools. Start with decompile_function on candidate #1 in both binaries, then follow the evidence.
+{backend.closing_instruction()}
 """
 
-    # Write MCP config pointing at the bridge (uses /opt/venv python so mcp is available)
-    import os as _os
-    venv_python = str(Path(_os.path.dirname(_os.sys.executable)) / "python")
-    mcp_config = {
-        "mcpServers": {
-            "ghidra": {
-                "command": venv_python,
-                "args": [str(_BRIDGE_SCRIPT), "--transport", "stdio"],
-                "env": {
-                    "GHIDRA_MCP_URL": f"http://127.0.0.1:{port}",
-                },
-            }
-        }
-    }
+    mcp_config = backend.mcp_config()
 
     with tempfile.NamedTemporaryFile(
-        mode="w", suffix=".json", prefix="ghidra_mcp_cfg_", delete=False
+        mode="w", suffix=".json", prefix=f"{backend.name}_mcp_cfg_", delete=False
     ) as f:
         json.dump(mcp_config, f)
         cfg_path = f.name
 
     print(f"  [identify/mcp] starting claude -p agent session (model={CLAUDE_MODEL}) ...", flush=True)
-    print(f"  [identify/mcp] bridge: {_BRIDGE_SCRIPT.name}  ghidra port: {port}", flush=True)
+    server_names = ", ".join(mcp_config.get("mcpServers", {}))
+    print(f"  [identify/mcp] backend: {backend.name}  servers: {server_names}", flush=True)
 
     try:
         cmd = [
@@ -1326,9 +1298,10 @@ Investigate the top candidates using the Ghidra tools. Start with decompile_func
             "--system-prompt", system_prompt,
             "--dangerously-skip-permissions",
             "--model", CLAUDE_MODEL,
+            "--disallowedTools", ",".join(_DENY_LOCAL_TOOLS),
         ]
         if not allow_web:
-            cmd += ["--allowedTools", "mcp__ghidra"]
+            cmd += ["--allowedTools", ",".join(backend.allowed_tools())]
         cmd.append(user_message)
 
         result = subprocess.run(
@@ -1398,7 +1371,7 @@ Investigate the top candidates using the Ghidra tools. Start with decompile_func
     if gather_blog_context:
         try:
             co_names = [cp["name"] for cp in co_patches]
-            ctx = _gather_mcp_context(mcp, fn_name, co_names)
+            ctx = _gather_mcp_context(backend, fn_name, co_names)
             result.decompiled_pre = ctx.get("decompiled_pre", "")
             result.decompiled_post = ctx.get("decompiled_post", "")
             result.callers = ctx.get("callers", [])
@@ -1431,7 +1404,7 @@ _DECOMPILE_TRUNCATE = 8_000  # chars per function per binary in blog context
 
 
 def _gather_mcp_context(
-    mcp: "GhidraMCPServer",  # type: ignore[name-defined]
+    backend: "AnalysisBackend",  # type: ignore[name-defined]
     fn_name: str,
     co_names: list[str],
 ) -> dict:
@@ -1440,22 +1413,19 @@ def _gather_mcp_context(
     Returns a dict with decompiled_pre, decompiled_post, callers, and per-co-patch
     decompilations keyed as co_{i}_decompiled_pre / co_{i}_decompiled_post.
     """
-    def _decompile(name: str, program: str) -> str:
-        result = mcp.decompile_function(name, program)
-        # decompile_function returns "[decompile error: ...]" on failure — treat as empty
-        if result.startswith("[decompile error"):
-            return ""
-        return result[:_DECOMPILE_TRUNCATE]
+    def _decompile(name: str, which: str) -> str:
+        # Backends normalise their own failure modes to "".
+        return backend.decompile(name, which)[:_DECOMPILE_TRUNCATE]
 
     ctx: dict = {}
     print(f"  [mcp/blog-ctx] decompiling {fn_name} (pre + post) ...", flush=True)
-    ctx["decompiled_pre"] = _decompile(fn_name, mcp.pre)
-    ctx["decompiled_post"] = _decompile(fn_name, mcp.post)
-    ctx["callers"] = mcp.get_callers(fn_name, mcp.post)
+    ctx["decompiled_pre"] = _decompile(fn_name, "pre")
+    ctx["decompiled_post"] = _decompile(fn_name, "post")
+    ctx["callers"] = backend.callers(fn_name, "post")
 
     for i, name in enumerate(co_names):
         print(f"  [mcp/blog-ctx] decompiling co-patch {name} (pre + post) ...", flush=True)
-        ctx[f"co_{i}_decompiled_pre"] = _decompile(name, mcp.pre)
-        ctx[f"co_{i}_decompiled_post"] = _decompile(name, mcp.post)
+        ctx[f"co_{i}_decompiled_pre"] = _decompile(name, "pre")
+        ctx[f"co_{i}_decompiled_post"] = _decompile(name, "post")
 
     return ctx
