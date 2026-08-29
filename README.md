@@ -77,7 +77,7 @@ names Ghidra or IDA.
 
 **IDA backend prerequisites.** The pipeline SSHes to the VM, uploads both binaries to `C:\ida_work\<CVE>`,
 launches an IDA instance per binary, discovers the port each one bound (the plugin auto-increments from
-13337), and opens an SSH tunnel per port via `start_ida_tunnel.sh`. So you need:
+13337), and opens an SSH tunnel per port via `scripts/start_ida_tunnel.sh`. So you need:
 
 - IDA Pro 9.3 on the VM with [`ida-pro-mcp`](https://github.com/mrexodia/ida-pro-mcp) installed
 - SSH access with the key at `IDA_VM_KEY`, and the VM routed into the container (`ROUTED_HOSTS` in `container.sh`)
@@ -88,9 +88,9 @@ Pass `--no-ida-shutdown` to leave the instances running so a later run can reuse
 To drive IDA by hand:
 
 ```bash
-./start_ida_tunnel.sh start 13337 13338   # forward the MCP servers into the container
-./start_ida_tunnel.sh status 13337 13338
-./start_ida_tunnel.sh stop 13337 13338
+./scripts/start_ida_tunnel.sh start 13337 13338   # forward the MCP servers into the container
+./scripts/start_ida_tunnel.sh status 13337 13338
+./scripts/start_ida_tunnel.sh stop 13337 13338
 ```
 
 Each stage result is cached in `data/traces/<CVE-ID>.json` so the pipeline can resume from any completed stage after a crash or forced re-run.
@@ -201,7 +201,7 @@ bundle exec jekyll serve
 `web/app.py` is an internal control panel (port 3011) for running the pipeline and reviewing results. Start it with:
 
 ```bash
-./start_web.sh
+./scripts/start_web.sh
 ```
 
 ## Project layout
@@ -222,10 +222,12 @@ pipeline/
   main.py             — orchestrator + CLI entry point
 web/app.py            — internal pipeline control panel (Flask, port 3011)
 run_cve.py            — single-CVE runner (development entry point)
-start_ida_tunnel.sh   — SSH port-forward for the IDA MCP server(s)
 test_pipeline.py      — stage-by-stage test harness
 publish_to_patchbook.py — publish blog posts to PatchBook submodule
-start_web.sh          — start the web UI
+scripts/
+  start_ida_tunnel.sh — SSH port-forward for the IDA MCP server(s)
+  start_web.sh        — start the web UI
+  start_patchbook.sh  — serve the PatchBook site locally
 patchbook/            — PatchBook Jekyll site (git submodule, public)
 vendor/ghidra-mcp/    — GhidraMCP server (submodule)
 fixtures/             — cached MSRC API responses

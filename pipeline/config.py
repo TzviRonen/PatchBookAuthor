@@ -24,7 +24,7 @@ GHIDRIFF_TIMEOUT = 3600  # 1 hour per binary pair
 
 # ── IDA Pro backend (--backend ida) ───────────────────────────────────────
 # IDA runs on a Windows VM; the pipeline reaches its MCP server over an SSH
-# tunnel opened by start_ida_tunnel.sh. Defaults mirror that script — keep
+# tunnel opened by scripts/start_ida_tunnel.sh. Defaults mirror that script — keep
 # the two in sync.
 IDA_VM_HOST = os.getenv("IDA_VM_HOST", "192.168.10.128")
 IDA_VM_USER = os.getenv("IDA_VM_USER", "auto")

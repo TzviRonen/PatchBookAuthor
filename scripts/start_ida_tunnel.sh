@@ -2,16 +2,19 @@
 # Forward the IDA Pro MCP server(s) (loopback-only on the Windows VM) to this container.
 #
 # Usage:
-#   ./start_ida_tunnel.sh [start|stop|status] [PORT ...]
+#   ./scripts/start_ida_tunnel.sh [start|stop|status] [PORT ...]
 #
 # With no ports, defaults to $IDA_MCP_PORT (13337). The IDA plugin auto-increments
 # its port when one is taken, so a pre/post pair typically lands on 13337 + 13338:
-#   ./start_ida_tunnel.sh start 13337 13338
+#   ./scripts/start_ida_tunnel.sh start 13337 13338
 set -euo pipefail
+
+# Repo root is one level up from this script (scripts/).
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
 VM_HOST=${IDA_VM_HOST:-192.168.10.128}
 VM_USER=${IDA_VM_USER:-auto}
-VM_KEY=${IDA_VM_KEY:-"$(dirname "$0")/auto_vm_key.pub"}
+VM_KEY=${IDA_VM_KEY:-"$REPO_ROOT/auto_vm_key.pub"}
 DEFAULT_PORT=${IDA_MCP_PORT:-13337}
 
 action=${1:-start}

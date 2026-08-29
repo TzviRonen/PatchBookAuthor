@@ -485,7 +485,7 @@ def main() -> None:
         default="ida",
         help=(
             "Disassembler backend for the identify stage. 'ida' (default) drives IDA "
-            "Pro on the Windows VM over an SSH tunnel (see start_ida_tunnel.sh); if it "
+            "Pro on the Windows VM over an SSH tunnel (see scripts/start_ida_tunnel.sh); if it "
             "is unavailable the run fails with an error rather than falling back. "
             "'ghidra' uses the local headless GhidraMCP server. Ghidriff still produces "
             "the diff either way."

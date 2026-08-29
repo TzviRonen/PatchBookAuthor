@@ -45,7 +45,7 @@ Which = Literal["pre", "post"]
 _REPO_ROOT = Path(__file__).parent.parent
 _BRIDGE_SCRIPT = _REPO_ROOT / "vendor" / "ghidra-mcp" / "bridge_mcp_ghidra.py"
 _VM_AGENT = Path(__file__).parent / "vm_agent.py"
-_TUNNEL_SCRIPT = _REPO_ROOT / "start_ida_tunnel.sh"
+_TUNNEL_SCRIPT = _REPO_ROOT / "scripts" / "start_ida_tunnel.sh"
 
 BACKENDS = ("ghidra", "ida")
 

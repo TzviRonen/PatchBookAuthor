@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-WORKSPACE="$(cd "$(dirname "$0")" && pwd)"
+WORKSPACE="$(cd "$(dirname "$0")/.." && pwd)"
 PYTHON="${PYTHON:-/opt/venv/bin/python3}"
 
 if [[ -z "${CONTAINER_PORTS:-}" ]]; then
