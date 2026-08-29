@@ -6,4 +6,6 @@
 !.env.example
 auto_vm_key.pub
 __pycache__/
-
+*.pyc
+*.pyo
+*.pyd
