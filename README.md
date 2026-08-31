@@ -204,7 +204,25 @@ python publish_to_patchbook.py --commit
 
 The script strips the pipeline-generated header and the `<!--meta-->` block, reads the title/excerpt from that block (falling back to scraping the body for older posts), extracts the CVSS, adds Jekyll YAML frontmatter, and writes dated filenames (`YYYY-MM-DD-cve-XXXX-slug.md`). When a CVE has several generations in `data/blogs/`, the **newest** one is published, so regenerating a post and re-publishing supersedes the previous version. Pushing the submodule triggers a GitHub Actions workflow that builds and deploys the site.
 
-To preview PatchBook locally:
+It also carries a post's `editors:` frontmatter forward (`_existing_block`). Those are credits readers add to themselves in the pull request that corrects a post, so re-publishing a CVE must not wipe them.
+
+### Reader feedback
+
+PatchBook takes two kinds of feedback on these AI-generated posts, deliberately kept apart:
+
+- **Votes** (`valid` / `AI-slop`) go to a Cloudflare Worker + D1 database, not this repo. They appear instantly, require a GitHub login, and are capped at one per account per post.
+- **Corrections** go through GitHub pull requests and appear only once merged.
+
+See `patchbook/ARCHITECTURE.md` for why, and `patchbook/DEVELOPMENT.md` for how to run it.
+
+To preview PatchBook locally, with the vote backend:
+
+```bash
+cd patchbook
+./scripts/start_dev.sh          # site on :3004, vote API on :3003
+```
+
+Site only, using the production renderer:
 
 ```bash
 cd patchbook
