@@ -94,13 +94,17 @@ def _extract_meta(text: str, stem: str) -> dict:
     return {"cve_id": cve_id, "title": title, "cvss": cvss, "excerpt": excerpt}
 
 
-def _existing_validations(dest: Path) -> list[str]:
-    """Return the `validations:` frontmatter block from an already-published post.
+def _existing_block(dest: Path, key: str) -> list[str]:
+    """Return a named frontmatter block from an already-published post.
 
-    Community validation marks (added by the GitHub Action, see
-    patchbook/scripts/apply_validation.py) live in the post frontmatter. Re-running
-    publish must not wipe them, so we carry the existing block forward verbatim.
-    Returns the block lines (`validations:` and its indented items) or [].
+    Used for `editors:` — the credits readers add to themselves in the pull
+    request that changes a post (see patchbook/_layouts/post.html). Those are
+    human contributions that the pipeline knows nothing about, so re-running
+    publish must not wipe them; we carry the existing block forward verbatim.
+    Returns the block lines (`<key>:` and its indented items) or [].
+
+    Votes are deliberately *not* handled here: they live in the vote database
+    behind patchbook/worker/, never in frontmatter.
     """
     if not dest.exists():
         return []
@@ -111,7 +115,7 @@ def _existing_validations(dest: Path) -> list[str]:
     if end is None:
         return []
     fm = lines[1:end]
-    start = next((i for i, l in enumerate(fm) if l.strip() == "validations:"), None)
+    start = next((i for i, l in enumerate(fm) if l.strip() == f"{key}:"), None)
     if start is None:
         return []
     block = [fm[start]]
@@ -213,8 +217,8 @@ def publish(filter_cve: str | None = None, do_commit: bool = False) -> None:
         dest_name = f"{date.strftime('%Y-%m-%d')}-{cve_lower}-{_slug(src)}.md"
         dest = POSTS_DIR / dest_name
 
-        # carry forward community validation marks from a prior publish
-        frontmatter_lines.extend(_existing_validations(dest))
+        # carry forward editor credits merged via PR since the last publish
+        frontmatter_lines.extend(_existing_block(dest, "editors"))
 
         frontmatter_lines.append("---")
         frontmatter_lines.append("")
