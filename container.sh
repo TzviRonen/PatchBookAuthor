@@ -12,7 +12,26 @@ PROJECT_HASH="$(printf '%s' "$WORKSPACE" | sha256sum | cut -c1-12)"
 IMAGE_NAME="ai-container-${PROJECT_SLUG}-${PROJECT_HASH}"
 CONTAINER_NAME="$IMAGE_NAME"
 SSH_KEY="$HOME/.ssh/ai_container_id_ed25519"
-GHIDRA_DIR="$HOME/Desktop/ghidra_12.1.2_PUBLIC"
+# Ghidra lives on the host and is bind-mounted read-only at /opt/ghidra.
+# Hardcoding one versioned path meant the mount silently vanished on a Ghidra
+# upgrade, so find it instead: an explicit GHIDRA_DIR always wins, then the
+# newest versioned install (sort -V, so 12.4.0 beats 11.0), then an
+# unversioned path.
+if [[ -z "${GHIDRA_DIR:-}" ]]; then
+    _ghidra_versioned=()
+    for _c in "$HOME/Desktop"/ghidra_*_PUBLIC "$HOME"/ghidra_*_PUBLIC /opt/ghidra_*_PUBLIC; do
+        [[ -d "$_c" ]] && _ghidra_versioned+=("$_c")
+    done
+    if (( ${#_ghidra_versioned[@]} )); then
+        GHIDRA_DIR=$(printf '%s\n' "${_ghidra_versioned[@]}" | sort -V | tail -1)
+    else
+        for _c in /opt/ghidra /usr/local/ghidra "$HOME/ghidra"; do
+            [[ -d "$_c" ]] && { GHIDRA_DIR="$_c"; break; }
+        done
+    fi
+    unset _ghidra_versioned _c
+fi
+
 # Host-side IPs that must stay reachable from inside the container (routed via the host).
 ROUTED_HOSTS=(192.168.10.128)
 

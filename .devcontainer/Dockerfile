@@ -7,7 +7,13 @@ RUN apt-get update && apt-get install -y \
     python3 python3-pip python3-venv python3-dev \
     gcc g++ make cmake build-essential \
     sudo bash vim nano less \
+    openjdk-21-jdk-headless \
     && rm -rf /var/lib/apt/lists/*
+
+# Ghidra is pure Java and will not start without a JDK. Ghidra itself is not in
+# this image — container.sh bind-mounts it read-only at /opt/ghidra.
+ENV JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64
+ENV GHIDRA_INSTALL_DIR=/opt/ghidra
 
 # Node.js 22 (required by Claude Code and Codex)
 RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
