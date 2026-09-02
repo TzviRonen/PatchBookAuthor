@@ -36,7 +36,50 @@ def init_db() -> None:
                 updated_at  TEXT NOT NULL
             );
         """)
+        # Migration: diagnostics blob (ground truth + validation reasons) for later triage.
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(cve_state)").fetchall()}
+        if "notes" not in cols:
+            conn.execute("ALTER TABLE cve_state ADD COLUMN notes TEXT")
     log.debug("Database initialised at %s", DB_PATH)
+
+
+# Recognised statuses:
+#   pending, diff_done, done                 — normal happy path
+#   binary_failed, diff_failed, blog_failed  — stage errors
+#   unresolved  — researched but no candidate validated against the CVE (NO report emitted)
+#   discovered  — queued by another CVE's run; process on a later pass
+
+
+def set_cve_notes(cve_id: str, notes: str) -> None:
+    now = datetime.utcnow().isoformat()
+    with _connect() as conn:
+        conn.execute(
+            "UPDATE cve_state SET notes=?, updated_at=? WHERE cve_id=?",
+            (notes, now, cve_id),
+        )
+
+
+def queue_discovered_cve(cve_id: str, update_id: str, title: str = "",
+                         binary_name: str | None = None, note: str = "") -> None:
+    """Record a CVE found incidentally while researching another, for a later run.
+
+    Never overwrites a CVE that is already done/in-progress; only inserts a fresh
+    'discovered' row so the normal per-CVE loop picks it up next pass.
+    """
+    now = datetime.utcnow().isoformat()
+    with _connect() as conn:
+        existing = conn.execute(
+            "SELECT status FROM cve_state WHERE cve_id=?", (cve_id,)
+        ).fetchone()
+        if existing:
+            return  # already tracked — don't disturb its state
+        conn.execute(
+            """INSERT INTO cve_state
+               (cve_id, update_id, title, binary_name, kb_number, status, notes,
+                created_at, updated_at)
+               VALUES (?, ?, ?, ?, NULL, 'discovered', ?, ?, ?)""",
+            (cve_id, update_id, title, binary_name, note, now, now),
+        )
 
 
 def is_update_processed(update_id: str) -> bool:

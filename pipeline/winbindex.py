@@ -66,13 +66,14 @@ def _parse_version_tuple(version_str: str) -> tuple:
     return tuple(int(x) for x in padded)
 
 
-def _fetch_index(filename: str) -> list[BinaryVersion]:
-    if filename in _INDEX_CACHE:
+def _fetch_index(filename: str, force: bool = False) -> list[BinaryVersion]:
+    if filename in _INDEX_CACHE and not force:
         return _INDEX_CACHE[filename]
 
-    # Disk cache — winbindex historical entries are immutable so no TTL needed
+    # Disk cache — historical winbindex entries are immutable, but recent builds are added
+    # over time, so callers pass force=True to bypass a stale snapshot that lacks a new build.
     disk_cache = DATA_DIR / "fixtures" / "winbindex" / f"{filename}.json"
-    if disk_cache.exists():
+    if disk_cache.exists() and not force:
         log.debug("Loading Winbindex index for %s from disk cache", filename)
         raw = json.loads(disk_cache.read_text(encoding="utf-8"))
     else:
@@ -224,4 +225,65 @@ def get_binary_pair(
     dest_dir.mkdir(parents=True, exist_ok=True)
     pre_path = _download_binary(filename, pre_patch, dest_dir)
     post_path = _download_binary(filename, post_patch, dest_dir)
+    return pre_path, post_path
+
+
+def _find_version(versions: list[BinaryVersion], lineage: int,
+                  revision: int) -> BinaryVersion | None:
+    for v in versions:
+        if v.build_component == lineage and v.revision_component == revision:
+            return v
+    return None
+
+
+def has_target(filename: str, lineage: int, revision: int) -> bool:
+    """True if *filename* has a build for (lineage, revision) in Winbindex."""
+    try:
+        versions = _fetch_index(filename)
+    except FileNotFoundError:
+        return False
+    if _find_version(versions, lineage, revision) is None:
+        versions = _fetch_index(filename, force=True)
+    return _find_version(versions, lineage, revision) is not None
+
+
+def get_binary_pair_for_target(
+    filename: str,
+    lineage: int,
+    revision: int,
+    dest_dir: Path,
+) -> tuple[Path, Path]:
+    """Return (pre, post) for the exact fixed *revision* within *lineage*.
+
+    ``post`` is the build carrying *revision*; ``pre`` is the immediately preceding
+    revision in the same lineage. Unlike get_binary_pair there is NO "latest as
+    post" fallback — if the fixed build cannot be located the call raises, so the
+    pipeline never diffs a bogus (post, post) or wrong-lineage pair.
+    """
+    versions = _fetch_index(filename)
+    post = _find_version(versions, lineage, revision)
+    if post is None:
+        # Stale snapshot may predate the fix build — refresh from the live index once.
+        versions = _fetch_index(filename, force=True)
+        post = _find_version(versions, lineage, revision)
+    if post is None:
+        raise FileNotFoundError(
+            f"{filename}: no build {lineage}.{revision} in Winbindex "
+            f"(binary likely not affected on this lineage)"
+        )
+
+    lineage_versions = [v for v in versions if v.build_component == lineage]
+    lineage_versions.sort(key=lambda v: v.version_tuple)
+    idx = lineage_versions.index(post)
+    if idx == 0:
+        raise ValueError(
+            f"{filename}: no pre-patch build before {lineage}.{revision} in lineage {lineage}"
+        )
+    pre = lineage_versions[idx - 1]
+
+    log.info("Target pair for %s: pre=%s  post=%s", filename,
+             pre.file_version, post.file_version)
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    pre_path = _download_binary(filename, pre, dest_dir)
+    post_path = _download_binary(filename, post, dest_dir)
     return pre_path, post_path

@@ -20,9 +20,11 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 
 from pipeline import config
-from pipeline.msrc import list_updates, fetch_cvrf, iter_cves
-from pipeline.kernel_filter import classify_cve
-from pipeline.winbindex import get_binary_pair
+from pipeline.msrc import list_updates, fetch_cvrf, iter_cves, fetch_ground_truth
+from pipeline.kernel_filter import candidate_binaries
+from pipeline.winbindex import get_binary_pair_for_target, has_target
+from pipeline.target_resolver import resolve_targets
+from pipeline.validate import validate_patch
 from pipeline.ghidriff_runner import run_ghidriff
 from pipeline.patch_identifier import identify_patch, PatchNotFoundError
 from pipeline.analysis_backend import BACKENDS, BackendError, make_backend
@@ -188,27 +190,47 @@ def run(cve_id: str, update_id: str | None, data_dir: Path, force: bool,
         _print(1, TOTAL_STEPS, "MSRC", f"{cve['title']} — {update_id}")
         trace.save("msrc", {"update_id": update_id, "cve": cve})
 
-    binary_name = classify_cve(cve)
-    if binary_name is None:
-        _fail(f"{cve_id} does not appear to be a kernel CVE (classify_cve returned None)")
+    candidates = candidate_binaries(cve)
+    if not candidates:
+        _fail(f"{cve_id} does not appear to be a kernel CVE (no candidate binaries)")
 
-    print(f"       Binary: {binary_name}")
-    print(f"       KBs:    {', '.join(cve.get('kb_numbers', []) or ['(none)'])}")
+    # Ground truth (authoritative CWE / vector / affected fixed-builds). Surface CWE + vector
+    # to the identify agent and the validation gate.
+    ground_truth = fetch_ground_truth(cve_id)
+    cve = {**cve, "cwe_list": ground_truth.get("cwe_list", []),
+           "vector_string": ground_truth.get("vector_string", "")}
 
-    # ── Step 2: Download binaries ───────────────────────────────────────────────
+    targets = resolve_targets(ground_truth)
+    if not targets:
+        _fail(f"{cve_id}: no affected Windows fixed-build resolved from MSRC — cannot pick a build pair")
+
+    print(f"       Candidates: {candidates}")
+    print(f"       Targets:    {[f'{t.lineage}.{t.revision}' for t in targets]}")
+    print(f"       CWE:        {ground_truth.get('cwe_list')}")
+
+    # ── Step 2: Select target + download binaries ──────────────────────────────
     _print(2, TOTAL_STEPS, "Downloading binaries...")
 
     cached = trace.get("binaries")
     if cached:
         pre_path = Path(cached["pre_path"])
         post_path = Path(cached["post_path"])
+        binary_name = cached["binary_name"]
+        target = next(t for t in targets if t.lineage == cached["lineage"])
         _print(2, TOTAL_STEPS, "Binaries (cached)",
-               f"pre={cached['pre_build']}  post={cached['post_build']}")
+               f"{binary_name} pre={cached['pre_build']} post={cached['post_build']}")
     else:
         binaries_dir = data_dir / "binaries" / cve_id
+        # First (target lineage × candidate binary) that actually shipped this fix build.
+        pick = next(((t, b) for t in targets for b in candidates
+                     if has_target(b, t.lineage, t.revision)), None)
+        if pick is None:
+            _fail(f"{cve_id}: none of {candidates} shipped a build for targets "
+                  f"{[f'{t.lineage}.{t.revision}' for t in targets]}")
+        target, binary_name = pick
         try:
-            pre_path, post_path = get_binary_pair(
-                binary_name, cve.get("kb_numbers", []), binaries_dir
+            pre_path, post_path = get_binary_pair_for_target(
+                binary_name, target.lineage, target.revision, binaries_dir,
             )
         except Exception as e:
             _fail(f"Binary download failed: {e}")
@@ -216,10 +238,11 @@ def run(cve_id: str, update_id: str | None, data_dir: Path, force: bool,
         pre_build = int(pre_path.suffix.lstrip("."))
         post_build = int(post_path.suffix.lstrip("."))
         _print(2, TOTAL_STEPS, "Binaries",
-               f"pre={pre_build}  post={post_build}  ({binary_name})")
+               f"{binary_name} pre={pre_build} post={post_build} lineage={target.lineage}")
         trace.save("binaries", {
             "pre_path": str(pre_path), "post_path": str(post_path),
             "pre_build": pre_build, "post_build": post_build,
+            "binary_name": binary_name, "lineage": target.lineage,
         })
 
     # Build numbers, needed by the blog metadata box. Derived from the file
@@ -368,9 +391,19 @@ def run(cve_id: str, update_id: str | None, data_dir: Path, force: bool,
                 "attack_vector": patch_result.attack_vector,
             })
         except PatchNotFoundError as e:
-            print(f"       WARNING: {e} — falling back to full diff for blog")
+            # No back-compat "full diff" fallback: a diff with no identifiable patch must
+            # not be turned into a report. Fail loudly (unresolved) instead of guessing.
+            if analysis_backend:
+                analysis_backend.stop()
+            elif mcp_server:
+                mcp_server.stop()
+            _fail(f"No patch identified for {cve_id}: {e} — refusing to emit an unverified report")
         except Exception as e:
-            print(f"       WARNING: patch identification error: {e} — falling back to full diff")
+            if analysis_backend:
+                analysis_backend.stop()
+            elif mcp_server:
+                mcp_server.stop()
+            _fail(f"Patch identification error for {cve_id}: {e}")
         finally:
             # Ghidra: shuts the Java server down. IDA: tears down the SSH
             # tunnels but deliberately leaves the VM instances running so the
@@ -380,6 +413,18 @@ def run(cve_id: str, update_id: str | None, data_dir: Path, force: bool,
             elif mcp_server:
                 mcp_server.stop()
             mcp_server = None
+
+    # ── Step 4b: Validate the candidate against the CVE's ground truth ──────────
+    # The gate that stops invalid reports: the identified function must match the CVE's
+    # stated bug class, contain a real (non-relocation) change, and straddle the fix build.
+    if patch_result is None:
+        _fail(f"No patch identified for {cve_id} — refusing to emit an unverified report")
+    ok, reasons = validate_patch(cve, ground_truth, patch_result)
+    for r in reasons:
+        print(f"       validate: {r}")
+    if not ok:
+        _fail(f"{cve_id}: {patch_result.function_name} did NOT validate against the CVE "
+              f"(bug class / real-change mismatch) — refusing to emit an unverified report")
 
     # ── Step 5: Generate blog post ─────────────────────────────────────────────
     if skip_blog:
@@ -406,8 +451,8 @@ def run(cve_id: str, update_id: str | None, data_dir: Path, force: bool,
             blog_text, blog_prompt = generate_blog_post(
                 cve, binary_name,
                 patch_result=patch_result,
-                diff_path=diff_path if patch_result is None else None,
-                versions={"pre_build": pre_build, "post_build": post_build},
+                versions={"pre_build": pre_build, "post_build": post_build,
+                          "lineage": target.lineage},
             )
         except Exception as e:
             _fail(f"Blog generation failed: {e}")

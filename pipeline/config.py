@@ -7,15 +7,29 @@ DIFFS_DIR = DATA_DIR / "diffs"
 BLOGS_DIR = DATA_DIR / "blogs"
 DB_PATH = DATA_DIR / "db" / "pipeline.db"
 
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+# No ANTHROPIC_API_KEY: LLM calls go through the `claude -p` CLI's own OAuth login.
 POLL_INTERVAL_HOURS = int(os.getenv("POLL_INTERVAL_HOURS", "24"))
 # Target Windows build number (3rd component of PE file version, e.g. 19041 for Win10 22H2).
 # Winbindex has multiple ntoskrnl.exe versions per Patch Tuesday (one per Windows release).
-# 19041 = Win10 21H2/22H2 | 22621 = Win11 22H2 | 17763 = Win10 LTSC 2019
+# 19041 = Win10 21H2/22H2 | 22621 = Win11 22H2/23H2 | 26100 = Win11 24H2 | 17763 = LTSC 2019
+#
+# NOTE: a CVE only ships a fix on the lineages it actually affects. We no longer assume every
+# CVE touches 19041 — the target lineage is resolved per-CVE from MSRC affected-product data
+# (see pipeline/target_resolver.py). PREFERRED_BUILD_LINEAGES only orders which affected
+# lineage we diff first (smallest/most-available base first). TARGET_WINDOWS_BUILD remains as
+# a legacy default for the deterministic blog metadata box when no target lineage is supplied.
 TARGET_WINDOWS_BUILD = int(os.getenv("TARGET_WINDOWS_BUILD", "19041"))
+PREFERRED_BUILD_LINEAGES = [
+    int(x) for x in os.getenv(
+        "PREFERRED_BUILD_LINEAGES", "19041,22621,26100,26200,28000"
+    ).split(",") if x.strip()
+]
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 
 MSRC_BASE_URL = "https://api.msrc.microsoft.com/cvrf/v2.0"
+# Security Update Guide API — authoritative per-CVE CWE list, CVSS vector, impact, and
+# per-product fixedBuildNumber. Used to resolve the correct affected build lineage.
+MSRC_SUG_BASE_URL = "https://api.msrc.microsoft.com/sug/v2.0/en-US"
 WINBINDEX_BASE_URL = "https://winbindex.m417z.com/data/by_filename_compressed"
 SYMBOL_SERVER_URL = "https://msdl.microsoft.com/download/symbols"
 

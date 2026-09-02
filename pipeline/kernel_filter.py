@@ -33,14 +33,48 @@ _SKIP_PATTERNS = re.compile(
 
 
 def classify_cve(cve: dict) -> str | None:
-    """Return the binary filename if *cve* is a kernel CVE, else None."""
+    """Return the single best-guess binary filename, else None. Kept for back-compat."""
+    cands = candidate_binaries(cve)
+    return cands[0] if cands else None
+
+
+# Binaries to try (in order) when the title/description names a subsystem only generically,
+# e.g. "Windows Kernel Remote Code Execution". A network-reachable kernel bug is frequently
+# fixed in a transport/driver (tcpip.sys, netio.sys, afd.sys), not ntoskrnl.exe — the single
+# keyword guess is exactly why CVE-2026-45657's tcpip.sys fix was missed.
+_GENERIC_KERNEL_FALLBACK = [
+    "ntoskrnl.exe", "tcpip.sys", "netio.sys", "afd.sys", "fwpkclnt.sys",
+]
+_NETWORK_HINT = re.compile(r"over a network|network|remote|tcp/?ip|udp|packet|ipv[46]", re.I)
+
+
+def candidate_binaries(cve: dict) -> list[str]:
+    """Return a ranked list of candidate binaries to diff for *cve* (empty if not kernel).
+
+    Keyword-rule matches come first (most specific), then a generic kernel/network fallback
+    set so the research loop can try alternatives when the first guess does not validate.
+    """
     text = f"{cve.get('title', '')} {cve.get('description', '')}"
-
     if _SKIP_PATTERNS.search(text):
-        return None
+        return []
 
+    ranked: list[str] = []
     for pattern, binary in _RULES:
-        if pattern.search(text):
-            return binary
+        if pattern.search(text) and binary not in ranked:
+            ranked.append(binary)
 
-    return None
+    if not ranked:
+        return []
+
+    # If the CVE is network-reachable, the fix is more likely in a transport/driver than in
+    # core ntoskrnl.exe. Add the transport fallbacks AND demote ntoskrnl.exe below them, so
+    # a generic "Windows Kernel" network CVE tries tcpip.sys/netio.sys first (this is what
+    # separated CVE-2026-45657's real tcpip.sys fix from a UAF-shaped ntoskrnl change).
+    if _NETWORK_HINT.search(text):
+        for b in _GENERIC_KERNEL_FALLBACK:
+            if b not in ranked:
+                ranked.append(b)
+        if "ntoskrnl.exe" in ranked:
+            ranked = [b for b in ranked if b != "ntoskrnl.exe"] + ["ntoskrnl.exe"]
+    return ranked
+

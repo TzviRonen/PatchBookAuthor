@@ -9,3 +9,29 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
+node_modules/
+package.json
+package-lock.json
+
+# ── Generated pipeline artifacts (large / regenerable — never commit) ──────────
+# Downloaded PE binaries and Microsoft PDB symbols
+data/binaries/
+data/symbols/
+# Ghidra projects + ghidriff outputs (multi-GB analysis databases)
+data/ghidra_projects/
+data/diffs/
+# Per-run state, caches, scratch, and ad-hoc analysis dumps
+data/cache/
+data/db/
+data/decomp*/
+data/findings/
+data/traces/
+data/run_trace.json
+# Raw LLM-input dumps saved next to each report (regenerable, large)
+data/blogs/*.prompt.txt
+
+# Analysis-artifact file types, wherever they land
+*.gzf
+*.gbf
+*.i64
+*.pdb

@@ -8,7 +8,7 @@ from typing import Iterator
 
 import requests
 
-from pipeline.config import MSRC_BASE_URL, DATA_DIR
+from pipeline.config import MSRC_BASE_URL, MSRC_SUG_BASE_URL, DATA_DIR
 
 log = logging.getLogger(__name__)
 
@@ -21,6 +21,83 @@ def _get(path: str, **kwargs) -> dict:
     resp = _SESSION.get(url, timeout=30, **kwargs)
     resp.raise_for_status()
     return resp.json()
+
+
+# ---------------------------------------------------------------------------
+# Security Update Guide (SUG) API — authoritative per-CVE ground truth
+# ---------------------------------------------------------------------------
+# The CVRF document lists KBs for *all* affected products lumped together, which is
+# too coarse to pick the right build lineage. The SUG API exposes, per CVE:
+#   - cweList (e.g. CWE-416 Use After Free, CWE-122 Heap-based Buffer Overflow)
+#   - vectorString / baseScore / impact / severity
+#   - one affectedProduct row per Windows release, each with its fixedBuildNumber + KB
+# We treat this as the single source of truth for which lineage/build to diff and for
+# validating that a candidate patch matches the CVE's real bug class and attack vector.
+
+
+def _sug_get(path: str, **params) -> dict:
+    url = f"{MSRC_SUG_BASE_URL}{path}"
+    resp = _SESSION.get(url, timeout=30, params=params or None)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def fetch_vuln_details(cve_id: str) -> dict:
+    """Return normalised ground truth for *cve_id* from the SUG API.
+
+    Keys: cwe_list, impact, severity, base_score, vector_string, exploited,
+    publicly_disclosed. Empty dict if the CVE is not found.
+    """
+    try:
+        d = _sug_get(f"/vulnerability/{cve_id}")
+    except requests.HTTPError as e:
+        log.warning("SUG vulnerability fetch failed for %s: %s", cve_id, e)
+        return {}
+    return {
+        "cwe_list": d.get("cweList", []) or [],
+        "impact": d.get("impact", ""),
+        "severity": d.get("severity", ""),
+        "base_score": d.get("baseScore"),
+        "vector_string": d.get("vectorString", ""),
+        "exploited": d.get("exploited"),
+        "publicly_disclosed": d.get("publiclyDisclosed"),
+        "title": d.get("cveTitle", ""),
+        "description": d.get("unformattedDescription") or d.get("description", ""),
+    }
+
+
+def fetch_affected_products(cve_id: str) -> list[dict]:
+    """Return per-product affected rows for *cve_id* from the SUG API.
+
+    Each row: {product, fixed_build (e.g. '10.0.22631.7219'), kb (e.g. 'KB5093998')}.
+    The fixed_build's 3rd component is the build lineage; the 4th is the fixed revision.
+    """
+    flt = f"cveNumber eq '{cve_id}'"
+    try:
+        d = _sug_get("/affectedProduct", **{"$filter": flt})
+    except requests.HTTPError as e:
+        log.warning("SUG affectedProduct fetch failed for %s: %s", cve_id, e)
+        return {}.get("value", [])
+    rows: list[dict] = []
+    for v in d.get("value", []):
+        product = v.get("product") or v.get("productName") or ""
+        for kb in (v.get("kbArticles") or []):
+            fixed = kb.get("fixedBuildNumber") or ""
+            name = kb.get("articleName") or ""
+            if fixed:
+                rows.append({
+                    "product": product,
+                    "fixed_build": fixed,
+                    "kb": f"KB{name}" if name and not str(name).upper().startswith("KB") else name,
+                })
+    return rows
+
+
+def fetch_ground_truth(cve_id: str) -> dict:
+    """Combine fetch_vuln_details + fetch_affected_products into one ground-truth record."""
+    gt = fetch_vuln_details(cve_id)
+    gt["affected_products"] = fetch_affected_products(cve_id)
+    return gt
 
 
 def list_updates(since: datetime | None = None) -> list[dict]:

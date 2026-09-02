@@ -111,8 +111,9 @@ def _metadata_box(
     lines: list[str] = []
 
     if versions and versions.get("pre_build") and versions.get("post_build"):
-        pre = f"10.0.{TARGET_WINDOWS_BUILD}.{versions['pre_build']}"
-        post = f"10.0.{TARGET_WINDOWS_BUILD}.{versions['post_build']}"
+        lineage = versions.get("lineage") or TARGET_WINDOWS_BUILD
+        pre = f"10.0.{lineage}.{versions['pre_build']}"
+        post = f"10.0.{lineage}.{versions['post_build']}"
         lines.append(f"- **Affected binary:** `{binary_name}` {pre} → {post}")
     elif binary_name:
         lines.append(f"- **Affected binary:** `{binary_name}`")

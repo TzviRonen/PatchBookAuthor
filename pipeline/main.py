@@ -1,5 +1,6 @@
 """Orchestrator: poll MSRC → filter → download → diff → blog."""
 import logging
+import re
 import sys
 import time
 from datetime import datetime, timedelta
@@ -11,13 +12,15 @@ import schedule
 from pipeline import config
 from pipeline.database import (
     init_db, is_update_processed, mark_update_processed,
-    upsert_cve, set_cve_status, get_cve,
+    upsert_cve, set_cve_status, set_cve_notes, get_cve,
 )
-from pipeline.msrc import list_updates, fetch_cvrf, iter_cves
-from pipeline.kernel_filter import classify_cve
-from pipeline.winbindex import get_binary_pair
+from pipeline.msrc import list_updates, fetch_cvrf, iter_cves, fetch_ground_truth
+from pipeline.kernel_filter import candidate_binaries
+from pipeline.winbindex import get_binary_pair_for_target, has_target
 from pipeline.ghidriff_runner import run_ghidriff
 from pipeline.patch_identifier import identify_patch, PatchNotFoundError
+from pipeline.target_resolver import resolve_targets
+from pipeline.validate import validate_patch
 from pipeline.blog_generator import generate_blog_post, save_blog_post
 
 
@@ -32,55 +35,107 @@ def _setup_logging() -> None:
 log = logging.getLogger("pipeline.main")
 
 
-def process_cve(cve: dict, binary_name: str) -> None:
+def _emit_report(cve: dict, binary_name: str, patch_result, target, pre_path,
+                 diagnostics: list[str]) -> bool:
+    """Generate + save the blog for a validated patch. Returns True on success."""
     cve_id = cve["id"]
-    binaries_dir = config.BINARIES_DIR / cve_id
-    diffs_dir = config.DIFFS_DIR
-    blogs_dir = config.BLOGS_DIR
-
+    # _download_binary names files "<binary>.<revision>"; recover the pre revision.
+    pre_rev = None
+    m = re.search(r"\.(\d+)$", pre_path.name)
+    if m:
+        pre_rev = int(m.group(1))
+    versions = {"pre_build": pre_rev, "post_build": target.revision, "lineage": target.lineage}
     try:
-        log.info("[%s] Downloading binaries for %s (KB: %s)",
-                 cve_id, binary_name, cve.get("kb_numbers"))
-        pre_path, post_path = get_binary_pair(
-            binary_name,
-            cve.get("kb_numbers", []),
-            binaries_dir,
+        blog_text, blog_prompt = generate_blog_post(
+            cve, binary_name, patch_result=patch_result, versions=versions,
         )
-    except Exception as exc:
-        log.warning("[%s] Binary download failed: %s", cve_id, exc)
-        set_cve_status(cve_id, "binary_failed", error=str(exc))
-        return
-
-    diff_name = cve_id.replace("/", "-")
-    try:
-        log.info("[%s] Running ghidriff", cve_id)
-        diff_path = run_ghidriff(pre_path, post_path, diffs_dir, diff_name)
-        set_cve_status(cve_id, "diff_done", diff_path=str(diff_path))
-    except Exception as exc:
-        log.warning("[%s] ghidriff failed: %s", cve_id, exc)
-        set_cve_status(cve_id, "diff_failed", error=str(exc))
-        return
-
-    patch_result = None
-    try:
-        log.info("[%s] Identifying patch function", cve_id)
-        patch_result = identify_patch(cve, diff_path)
-        log.info("[%s] Identified: %s (confidence=%d, type=%s)",
-                 cve_id, patch_result.function_name, patch_result.confidence, patch_result.patch_type)
-    except PatchNotFoundError as exc:
-        log.warning("[%s] Patch identification failed: %s — falling back to full diff", cve_id, exc)
-    except Exception as exc:
-        log.warning("[%s] Patch identification error: %s — falling back to full diff", cve_id, exc)
-
-    try:
-        log.info("[%s] Generating blog post", cve_id)
-        blog_text, blog_prompt = generate_blog_post(cve, binary_name, patch_result=patch_result, diff_path=diff_path)
-        blog_path = save_blog_post(blog_text, cve_id, blogs_dir, title=cve.get("title", ""), prompt=blog_prompt)
+        blog_path = save_blog_post(blog_text, cve_id, config.BLOGS_DIR,
+                                   title=cve.get("title", ""), prompt=blog_prompt)
         set_cve_status(cve_id, "done", blog_path=str(blog_path))
+        set_cve_notes(cve_id, "VALIDATED\n" + "\n".join(diagnostics))
         log.info("[%s] Done → %s", cve_id, blog_path)
+        return True
     except Exception as exc:
         log.warning("[%s] Blog generation failed: %s", cve_id, exc)
         set_cve_status(cve_id, "blog_failed", error=str(exc))
+        return False
+
+
+def process_cve(cve: dict, update_id: str) -> None:
+    """Research loop: try each affected lineage × candidate binary until a patch validates.
+
+    A report is emitted ONLY when identify_patch finds a function that validate_patch
+    confirms matches the CVE's ground truth. Otherwise the CVE is marked 'unresolved'
+    and NO report is written — the pipeline never publishes an unverified patch.
+    """
+    cve_id = cve["id"]
+    binaries_dir = config.BINARIES_DIR / cve_id
+
+    # ── Ground truth (authoritative CWE / vector / affected fixed-builds) ──
+    ground_truth = fetch_ground_truth(cve_id)
+    # Surface CWE + vector to the identify agent so it matches the real bug class.
+    cve = {**cve, "cwe_list": ground_truth.get("cwe_list", []),
+           "vector_string": ground_truth.get("vector_string", "")}
+
+    targets = resolve_targets(ground_truth)
+    if not targets:
+        log.warning("[%s] No affected fixed-build resolved — marking unresolved", cve_id)
+        set_cve_status(cve_id, "unresolved", error="no affected fixed-build from MSRC")
+        return
+
+    candidates = candidate_binaries(cve)
+    diagnostics: list[str] = []
+
+    for target in targets:
+        for binary_name in candidates:
+            if not has_target(binary_name, target.lineage, target.revision):
+                continue  # this binary isn't shipped/affected on this lineage+revision
+            tag = f"{binary_name}@{target.lineage}.{target.revision}"
+            try:
+                log.info("[%s] Trying %s", cve_id, tag)
+                pre_path, post_path = get_binary_pair_for_target(
+                    binary_name, target.lineage, target.revision, binaries_dir,
+                )
+            except Exception as exc:
+                diagnostics.append(f"{tag}: binary pair failed: {exc}")
+                continue
+
+            diff_name = f"{cve_id.replace('/', '-')}-{binary_name}-{target.lineage}"
+            try:
+                # start_mcp=False: the text-diff identify path only needs the .md; the MCP
+                # server is for the interactive IDA/Ghidra backend used by run_cve.py.
+                diff_path, _mcp = run_ghidriff(
+                    pre_path, post_path, config.DIFFS_DIR, diff_name, start_mcp=False,
+                )
+            except Exception as exc:
+                diagnostics.append(f"{tag}: ghidriff failed: {exc}")
+                continue
+
+            try:
+                patch_result = identify_patch(cve, diff_path)
+            except PatchNotFoundError as exc:
+                diagnostics.append(f"{tag}: no candidate identified ({exc})")
+                continue
+            except Exception as exc:
+                diagnostics.append(f"{tag}: identify error ({exc})")
+                continue
+
+            ok, reasons = validate_patch(cve, ground_truth, patch_result)
+            diagnostics.append(f"{tag}: candidate={patch_result.function_name} "
+                               f"conf={patch_result.confidence} valid={ok} :: {'; '.join(reasons)}")
+            if not ok:
+                log.info("[%s] %s: %s rejected by validation — keep researching",
+                         cve_id, tag, patch_result.function_name)
+                continue
+
+            log.info("[%s] VALIDATED %s in %s", cve_id, patch_result.function_name, tag)
+            if _emit_report(cve, binary_name, patch_result, target, pre_path, diagnostics):
+                return
+
+    # Nothing validated across all targets × binaries → do NOT publish anything.
+    log.warning("[%s] Unresolved after %d attempt(s) — no report emitted", cve_id, len(diagnostics))
+    set_cve_status(cve_id, "unresolved", error="no validated patch")
+    set_cve_notes(cve_id, "UNRESOLVED\n" + "\n".join(diagnostics))
 
 
 def run_pipeline() -> None:
@@ -107,23 +162,23 @@ def run_pipeline() -> None:
             continue
 
         for cve in iter_cves(cvrf):
-            binary_name = classify_cve(cve)
+            cands = candidate_binaries(cve)
             upsert_cve(
                 cve["id"], update_id, cve["title"],
-                binary_name, ",".join(cve.get("kb_numbers", [])),
+                cands[0] if cands else None, ",".join(cve.get("kb_numbers", [])),
             )
 
-            if binary_name is None:
+            if not cands:
                 log.debug("[%s] Not a kernel CVE, skipping", cve["id"])
                 continue
 
             existing = get_cve(cve["id"])
-            if existing and existing["status"] == "done":
-                log.debug("[%s] Already done", cve["id"])
+            if existing and existing["status"] in ("done", "unresolved"):
+                log.debug("[%s] Already %s", cve["id"], existing["status"])
                 continue
 
-            log.info("[%s] Kernel CVE: %s → %s", cve["id"], cve["title"], binary_name)
-            process_cve(cve, binary_name)
+            log.info("[%s] Kernel CVE: %s → candidates %s", cve["id"], cve["title"], cands)
+            process_cve(cve, update_id)
 
         mark_update_processed(update_id)
 
@@ -136,9 +191,10 @@ def run_pipeline() -> None:
 def main(once: bool, daemon: bool) -> None:
     _setup_logging()
 
-    if not config.ANTHROPIC_API_KEY:
-        log.error("ANTHROPIC_API_KEY is not set")
-        sys.exit(1)
+    # NB: the identify and blog stages call the `claude -p` CLI, which authenticates via its
+    # own OAuth/subscription login — no ANTHROPIC_API_KEY is used or needed. Requiring it here
+    # was misleading, and *setting* it makes the CLI prefer a (often invalid) API key over the
+    # working OAuth login. So there is deliberately no ANTHROPIC_API_KEY check.
 
     init_db()
 

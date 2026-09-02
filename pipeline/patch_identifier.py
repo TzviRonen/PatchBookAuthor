@@ -85,6 +85,51 @@ class PatchNotFoundError(Exception):
 # Step A: Parse ghidriff markdown
 # ---------------------------------------------------------------------------
 
+# Tokens that shift when a function is merely relocated (address, not logic, changes):
+# named address labels/globals/thunks with their hex suffix, and decompiler-assigned
+# stack/local/var names whose numeric suffix tracks the frame layout.
+_RELOC_NOISE_RE = re.compile(
+    r"(?:LAB_|DAT_|_DAT_|FUN_|sub_|UNK_|loc_|unk_|off_|jpt_)[0-9a-fA-F]+"
+    r"|0x1[0-9a-fA-F]{6,}"
+    r"|[a-zA-Z]?Stack_[0-9a-fA-F]+"
+    r"|local_[0-9a-fA-F]+"
+    r"|[a-z]Var[0-9]+"
+    r"|uRam[0-9a-fA-F]+"
+)
+
+
+def _normalize_reloc(line: str) -> str:
+    """Collapse relocation-sensitive tokens so identical logic compares equal."""
+    return re.sub(r"\s+", " ", _RELOC_NOISE_RE.sub("§", line)).strip()
+
+
+def _real_change_counts(diff_content: str) -> tuple[int, int]:
+    """Return (added, removed) counts after cancelling relocation-only line pairs.
+
+    Added/removed lines are normalised; any added line whose normalised form also
+    appears as a removed line is treated as an unchanged (relocated) pair and dropped.
+    A function that only moved address therefore reports (0, 0) and is discarded.
+    """
+    added_raw = [l[1:] for l in diff_content.splitlines()
+                 if l.startswith("+") and not l.startswith("++")]
+    removed_raw = [l[1:] for l in diff_content.splitlines()
+                   if l.startswith("-") and not l.startswith("--")]
+
+    from collections import Counter
+    rem_norm = Counter(_normalize_reloc(l) for l in removed_raw if l.strip())
+    real_added = 0
+    for l in added_raw:
+        if not l.strip():
+            continue
+        n = _normalize_reloc(l)
+        if rem_norm.get(n, 0) > 0:
+            rem_norm[n] -= 1          # cancels a matching removed line (pure relocation)
+        else:
+            real_added += 1
+    real_removed = sum(rem_norm.values())
+    return real_added, real_removed
+
+
 def parse_ghidriff_sections(diff_path: Path) -> list[FunctionSection]:
     """Parse ghidriff .md output into per-function diff sections.
 
@@ -133,19 +178,29 @@ def parse_ghidriff_sections(diff_path: Path) -> list[FunctionSection]:
             fn_end = fn_matches[fi + 1].start() if fi + 1 < len(fn_matches) else len(cat_text)
             fn_text = cat_text[fn_start:fn_end]
 
-            # Extract diff content from ```diff blocks
-            diff_blocks = re.findall(r"```diff\n(.*?)```", fn_text, re.DOTALL)
-            diff_content = "\n".join(diff_blocks)
+            # Extract diff content from ```diff blocks, but SKIP the "Called Diff" block.
+            # ghidriff emits a separate diff of the callee list (headers end with
+            # " called"); its +/- lines are metadata, not code, and appear even when a
+            # function only moved address — counting them resurrected the relocation-only
+            # WmipUpdateModifyGuid false positive.
+            all_blocks = re.findall(r"```diff\n(.*?)```", fn_text, re.DOTALL)
+            code_blocks = [b for b in all_blocks
+                           if not re.search(r"^(?:---|\+\+\+) .*\bcalled\s*$", b, re.MULTILINE)]
+            diff_content = "\n".join(code_blocks)
 
-            added = len(re.findall(r"^\+(?!\+)", diff_content, re.MULTILINE))
-            removed = len(re.findall(r"^-(?!-)", diff_content, re.MULTILINE))
+            # Count only *real* changes: a function that merely moved to a new address
+            # shows fake +/- lines (renamed LAB_/DAT_/FUN_ labels, shifted stack-var
+            # suffixes). Normalising those away and cancelling matched pairs prevents
+            # relocation noise from becoming a candidate (root cause of the invalid
+            # WmipUpdateModifyGuid report).
+            added, removed = _real_change_counts(diff_content)
 
             has_sig = bool(re.search(
                 r"^\+.*\b(param|arg|__cdecl|__stdcall|NTSTATUS|VOID|HANDLE|PVOID)\b",
                 diff_content, re.MULTILINE | re.IGNORECASE,
             ))
 
-            # Include if there are actual code changes (skip pure metadata/empty sections)
+            # Include only if there are real code changes (skip metadata/relocation-only)
             if added > 0 or removed > 0:
                 sections.append(FunctionSection(
                     name=fn_name,
@@ -168,8 +223,7 @@ def _parse_fallback(text: str) -> list[FunctionSection]:
         before = text[:block_m.start()]
         name_m = re.search(r"[`*]{0,2}([A-Za-z_][A-Za-z0-9_:]{4,})[`*]{0,2}\s*$", before)
         name = name_m.group(1) if name_m else f"block_{len(sections)}"
-        added = len(re.findall(r"^\+(?!\+)", block, re.MULTILINE))
-        removed = len(re.findall(r"^-(?!-)", block, re.MULTILINE))
+        added, removed = _real_change_counts(block)
         if added or removed:
             sections.append(FunctionSection(name, block, added, removed, False))
     log.info("Fallback parser found %d sections", len(sections))
@@ -265,6 +319,47 @@ def _extract_cve_keywords(cve: dict) -> list[str]:
             seen.add(kw)
             result.append(kw)
     return result
+
+
+# Map the CVE's stated bug class -> the agent patch_type it should resolve to. The MSRC
+# description reliably names the class ("Use after free in Windows Kernel...", "Heap-based
+# buffer overflow in Windows TCP/IP..."), which is the decisive signal when one build's diff
+# contains fixes for several co-shipped CVEs (e.g. 22621 tcpip.sys carries BOTH the 45657 UAF
+# and the 42904 overflow). Without this the agent picks whichever fix it is most confident
+# about, misattributing 42904's overflow to 45657.
+_DESC_CLASS_PATTERNS = [
+    (re.compile(r"use[\s-]?after[\s-]?free", re.I), "use_after_free"),
+    (re.compile(r"heap[\s-]?based buffer overflow|buffer overflow|out[\s-]?of[\s-]?bounds write|stack[\s-]?based buffer overflow", re.I), "buffer_overflow"),
+    (re.compile(r"time[\s-]?of[\s-]?check|toctou|race condition", re.I), "TOCTOU"),
+    (re.compile(r"out[\s-]?of[\s-]?bounds read|information disclosure|buffer over[\s-]?read|uninitialized", re.I), "info_leak"),
+    (re.compile(r"null[\s-]?pointer dereference", re.I), "null_deref"),
+]
+_CWE_CLASS = {
+    416: "use_after_free", 415: "use_after_free",
+    122: "buffer_overflow", 121: "buffer_overflow", 787: "buffer_overflow",
+    120: "buffer_overflow", 190: "buffer_overflow", 191: "buffer_overflow",
+    367: "TOCTOU", 476: "null_deref",
+    200: "info_leak", 908: "info_leak", 457: "info_leak", 125: "info_leak",
+}
+
+
+def _cve_primary_classes(cve: dict) -> set[str]:
+    """Return the CVE's authoritative bug class(es) as agent patch_type strings.
+
+    Prefers the MSRC *description*'s stated class (the disambiguator when a diff carries
+    multiple co-shipped fixes); falls back to the CWE list only if the description is silent.
+    Empty set means "unknown" — caller should not filter by class.
+    """
+    desc = f"{cve.get('title', '')} {cve.get('description', '')}"
+    stated = {cls for pat, cls in _DESC_CLASS_PATTERNS if pat.search(desc)}
+    if stated:
+        return stated
+    from_cwe: set[str] = set()
+    for c in cve.get("cwe_list", []) or []:
+        m = re.search(r"CWE-(\d+)", str(c))
+        if m and int(m.group(1)) in _CWE_CLASS:
+            from_cwe.add(_CWE_CLASS[int(m.group(1))])
+    return from_cwe
 
 
 def _detect_bug_class(cve: dict) -> list[str]:
@@ -633,13 +728,22 @@ def _call_agent(cve: dict, section: FunctionSection, sections_by_name: dict[str,
     if len(cve_desc) > 1500:
         cve_desc = cve_desc[:1500] + "..."
 
+    # Ground truth from the MSRC SUG API (when available) so the agent matches the diff to
+    # the CVE's real bug class and attack vector instead of guessing from the title.
+    cwe_line = ""
+    if cve.get("cwe_list"):
+        cwe_line = f"- **CWE (authoritative)**: {', '.join(cve['cwe_list'])}\n"
+    vector_line = ""
+    if cve.get("vector_string"):
+        vector_line = f"- **CVSS vector**: {cve['vector_string']}\n"
+
     user_msg = f"""\
 ## CVE Information
 
 - **CVE ID**: {cve['id']}
 - **Title**: {cve.get('title', '')}
 - **KB**: {', '.join(cve.get('kb_numbers', []))}
-- **Description**: {cve_desc}
+{cwe_line}{vector_line}- **Description**: {cve_desc}
 {caller_block}
 ## Changed function to evaluate: `{section.name}`
 
@@ -877,6 +981,10 @@ def identify_patch(cve: dict, diff_path: Path) -> PatchResult:
     agent_evals: list[AgentEval] = []
     consecutive_negatives = 0
     best_positive: tuple[AgentEval, FunctionSection] | None = None
+    best_class_match: tuple[AgentEval, FunctionSection] | None = None
+    primary_classes = _cve_primary_classes(cve)
+    if primary_classes:
+        log.info("CVE primary bug class(es): %s", ", ".join(sorted(primary_classes)))
     cve_id = cve.get("id", "unknown")
 
     for i, scored_sec in enumerate(candidates):
@@ -900,16 +1008,25 @@ def identify_patch(cve: dict, diff_path: Path) -> PatchResult:
         log.info("  Agent: is_patch=%s confidence=%d  — %s",
                  eval_result.is_patch, eval_result.confidence, eval_result.reasoning[:120])
 
-        if eval_result.is_patch and eval_result.confidence >= CONFIDENCE_THRESHOLD:
-            log.info("IDENTIFIED patch: %s (confidence=%d) after evaluating %d candidate(s)",
-                     sec.name, eval_result.confidence, i + 1)
+        # A candidate whose bug class conflicts with the CVE's stated class must NOT be
+        # accepted just because the agent is confident — that is how 42904's overflow got
+        # attributed to 45657. Only auto-accept a high-confidence match of the right class.
+        matches_class = (not primary_classes) or (eval_result.patch_type in primary_classes)
+
+        if (eval_result.is_patch and eval_result.confidence >= CONFIDENCE_THRESHOLD
+                and matches_class):
+            log.info("IDENTIFIED patch: %s (confidence=%d, class=%s) after %d candidate(s)",
+                     sec.name, eval_result.confidence, eval_result.patch_type, i + 1)
             co_patches = _find_co_patches(sec, eval_result, sections, sections_by_name, cve)
             return _make_result(sec, eval_result, i + 1, heuristic_log, agent_evals, co_patches)
 
-        # Track best positive below threshold for fallback
+        # Track best positives for the post-loop decision.
         if eval_result.is_patch and eval_result.confidence >= FALLBACK_CONFIDENCE_THRESHOLD:
             if best_positive is None or eval_result.confidence > best_positive[0].confidence:
                 best_positive = (eval_result, sec)
+            if matches_class and (best_class_match is None
+                                  or eval_result.confidence > best_class_match[0].confidence):
+                best_class_match = (eval_result, sec)
 
         if not eval_result.is_patch and eval_result.confidence >= NEGATIVE_CONFIDENCE_THRESHOLD:
             consecutive_negatives += 1
@@ -923,13 +1040,14 @@ def identify_patch(cve: dict, diff_path: Path) -> PatchResult:
         else:
             consecutive_negatives = 0
 
-    # Fallback: return best is_patch=True result if it met the lower threshold
-    if best_positive is not None:
-        best_eval, best_sec = best_positive
-        log.info(
-            "IDENTIFIED patch (fallback, confidence=%d): %s — no candidate reached %d%%",
-            best_eval.confidence, best_sec.name, CONFIDENCE_THRESHOLD,
-        )
+    # Post-loop: prefer a candidate matching the CVE's stated bug class over a merely
+    # higher-confidence candidate of the wrong class (co-shipped-CVE disambiguation).
+    chosen = best_class_match or best_positive
+    if chosen is not None:
+        best_eval, best_sec = chosen
+        why = "class-match" if chosen is best_class_match else "fallback"
+        log.info("IDENTIFIED patch (%s, confidence=%d, class=%s): %s",
+                 why, best_eval.confidence, best_eval.patch_type, best_sec.name)
         co_patches = _find_co_patches(best_sec, best_eval, sections, sections_by_name, cve)
         return _make_result(best_sec, best_eval, len(agent_evals), heuristic_log, agent_evals,
                             co_patches)
