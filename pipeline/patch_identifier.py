@@ -130,6 +130,38 @@ def _real_change_counts(diff_content: str) -> tuple[int, int]:
     return real_added, real_removed
 
 
+def reconstruct_pre_post(section_text: str) -> tuple[str, str]:
+    """Rebuild the full pre- and post-patch decompiled function from a ghidriff section.
+
+    ghidriff emits a full-context unified diff of the pseudo-C in the "### <fn> Diff"
+    block. Space-prefixed lines are common to both, '-' lines are pre-only, '+' are
+    post-only. Reassembling both sides gives the complete before/after decompilation
+    that the reports show under "Pre/Post patch functions" — no re-analysis needed.
+    """
+    all_blocks = re.findall(r"```diff\n(.*?)```", section_text, re.DOTALL)
+    if not all_blocks:
+        all_blocks = [section_text]  # already a raw diff (e.g. a co-patch's diff field)
+    code = [b for b in all_blocks
+            if not re.search(r"^(?:---|\+\+\+) .*\bcalled\s*$", b, re.MULTILINE)]
+    if not code:
+        return "", ""
+    db = code[0]
+    pre: list[str] = []
+    post: list[str] = []
+    for line in db.splitlines():
+        if line.startswith("+++") or line.startswith("---") or line.startswith("@@"):
+            continue
+        if line.startswith("+"):
+            post.append(line[1:])
+        elif line.startswith("-"):
+            pre.append(line[1:])
+        else:  # context line (leading space) or blank — belongs to both sides
+            body = line[1:] if line.startswith(" ") else line
+            pre.append(body)
+            post.append(body)
+    return "\n".join(pre).strip("\n"), "\n".join(post).strip("\n")
+
+
 def parse_ghidriff_sections(diff_path: Path) -> list[FunctionSection]:
     """Parse ghidriff .md output into per-function diff sections.
 

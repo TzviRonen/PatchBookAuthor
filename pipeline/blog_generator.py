@@ -307,8 +307,45 @@ def generate_blog_post(
 
     box = _metadata_box(cve, binary_name, patch_result, versions)
     blog_text = _prepend_metadata_box(blog_text, box)
+    blog_text = _append_decompilations(blog_text, patch_result)
 
     return blog_text, user_message
+
+
+def _append_decompilations(blog_text: str, patch_result: "PatchResult | None") -> str:
+    """Append full before/after decompilation sections for the patched function(s).
+
+    Reconstructed from the ghidriff full-context diff so every report ends with the
+    complete pre- and post-patch pseudo-C of the primary fix (and any co-patches).
+    """
+    if patch_result is None:
+        return blog_text
+    from pipeline.patch_identifier import reconstruct_pre_post
+
+    entries: list[tuple[str, str]] = []  # (fn_name, section_text)
+    if patch_result.full_diff:
+        entries.append((patch_result.function_name, patch_result.full_diff))
+    for co in (patch_result.co_patches or []):
+        diff = co.get("diff") or ""
+        if diff:
+            entries.append((co.get("name", "co-patch"), diff))
+
+    pre_parts, post_parts = [], []
+    for name, section in entries:
+        pre, post = reconstruct_pre_post(section)
+        if pre:
+            pre_parts.append(f"Full decompilation of `{name}` before the patch:\n\n```c\n{pre}\n```")
+        if post:
+            post_parts.append(f"Full decompilation of `{name}` after the patch:\n\n```c\n{post}\n```")
+
+    if not pre_parts and not post_parts:
+        return blog_text
+    out = blog_text.rstrip() + "\n"
+    if pre_parts:
+        out += "\n## Pre patch functions\n\n" + "\n\n".join(pre_parts) + "\n"
+    if post_parts:
+        out += "\n## Post patch functions\n\n" + "\n\n".join(post_parts) + "\n"
+    return out
 
 
 def _title_slug(title: str) -> str:
