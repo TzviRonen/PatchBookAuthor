@@ -1,43 +1,39 @@
-# All three services share the single image built from ./Dockerfile — the same
-# one ./container.sh builds for interactive work.
-#
-# The image COPYs no source and declares no entrypoint: the repo is mounted at
-# /workspace instead, so an edit takes effect without a rebuild, and each
-# service supplies its own command.
-#
-# Ghidra is not in the image. Point GHIDRA_DIR at a local install if it is not
-# already at /opt/ghidra.
-
-x-pipeline: &pipeline
-  build: .
-  env_file: .env
-  working_dir: /workspace
-  volumes:
-    - .:/workspace
-    - ./data:/data
-    - ${GHIDRA_DIR:-/opt/ghidra}:/opt/ghidra:ro
-  environment:
-    - DATA_DIR=/data
-
 services:
-  # Long-running: poll MSRC and process new CVEs as they appear.
   pipeline:
-    <<: *pipeline
-    entrypoint: ["scripts/entrypoint.sh"]
-    command: ["--daemon"]
+    build: .
+    env_file: .env
+    volumes:
+      - ./data:/data
+    environment:
+      - DATA_DIR=/data
     restart: unless-stopped
+    command: ["--daemon"]
 
-  # A single sweep, then exit.
   run-once:
-    <<: *pipeline
-    entrypoint: ["scripts/entrypoint.sh"]
-    command: ["--once"]
+    build: .
+    env_file: .env
+    volumes:
+      - ./data:/data
+    environment:
+      - DATA_DIR=/data
     profiles: ["once"]
+    command: ["--once"]
 
-  # One named CVE — used by ./run_and_publish.sh when the host cannot run the
-  # pipeline itself. DATA_DIR=/data is bound to ./data, so the blog this writes
-  # is published from outside the container afterwards.
+  # Single-CVE development runner, used by ./run_and_publish.sh.
+  #
+  # Mounts the working tree over /app so run_cve.py — which the image does not
+  # COPY — and any local edit are used directly, with no rebuild between runs.
+  # Installed site-packages live outside /app and are unaffected by the mount.
+  #
+  # DATA_DIR=/data is bound to ./data on the host, so the blog this writes is
+  # readable by publish_to_patchbook.py running outside the container.
   cve:
-    <<: *pipeline
-    entrypoint: ["python", "run_cve.py"]
+    build: .
+    env_file: .env
+    volumes:
+      - .:/app
+      - ./data:/data
+    environment:
+      - DATA_DIR=/data
     profiles: ["cve"]
+    entrypoint: ["python", "run_cve.py"]

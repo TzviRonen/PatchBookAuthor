@@ -33,7 +33,7 @@ find_free_ports() {
 
 build_image() {
     echo "[*] Building image '$IMAGE_NAME'..."
-    docker build -t "$IMAGE_NAME" -f "$WORKSPACE/.devcontainer/Dockerfile" "$WORKSPACE"
+    docker build -t "$IMAGE_NAME" "$WORKSPACE/.devcontainer"
 }
 
 if ! docker image inspect "$IMAGE_NAME" &>/dev/null; then

@@ -96,17 +96,6 @@ Running in Docker needs `.env` (compose declares `env_file: .env`) — copy `.en
 `ANTHROPIC_API_KEY`. If neither path is available the script says which tools are missing and how to
 install them, rather than failing inside the pipeline with `No such file or directory: 'ghidriff'`.
 
-### The development container
-
-`container.sh` builds `.devcontainer/Dockerfile`, which now carries JDK 21 and everything in
-`requirements.txt`, so `run_cve.py` runs natively inside it and `run_and_publish.sh` takes the
-native path. Ghidra itself is **not** baked in — it is bind-mounted at `/opt/ghidra`, and
-`GHIDRA_INSTALL_DIR` points there.
-
-The image builds with the **repo root** as its context, not `.devcontainer/`, so the Dockerfile can
-`COPY requirements.txt`. `.dockerignore` keeps that context at a few MB rather than the ~2.2 GB the
-tree weighs — without it every build would ship `data/` and `patchbook/` to the daemon.
-
 ### Analysis backends
 
 The identify stage drives a disassembler over MCP. `--backend` selects which one; ghidriff still
