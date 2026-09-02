@@ -18,3 +18,22 @@ services:
       - DATA_DIR=/data
     profiles: ["once"]
     command: ["--once"]
+
+  # Single-CVE development runner, used by ./run_and_publish.sh.
+  #
+  # Mounts the working tree over /app so run_cve.py — which the image does not
+  # COPY — and any local edit are used directly, with no rebuild between runs.
+  # Installed site-packages live outside /app and are unaffected by the mount.
+  #
+  # DATA_DIR=/data is bound to ./data on the host, so the blog this writes is
+  # readable by publish_to_patchbook.py running outside the container.
+  cve:
+    build: .
+    env_file: .env
+    volumes:
+      - .:/app
+      - ./data:/data
+    environment:
+      - DATA_DIR=/data
+    profiles: ["cve"]
+    entrypoint: ["python", "run_cve.py"]

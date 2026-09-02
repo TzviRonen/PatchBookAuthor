@@ -65,8 +65,9 @@ error rather than silently falling back — pass `--backend ghidra` to analyse l
 
 ### Run and publish in one step
 
-`run_and_publish.sh` runs the pipeline for a CVE and then publishes the resulting post to PatchBook.
-Everything before its own flags is forwarded verbatim to `run_cve.py`:
+`run_and_publish.sh` runs the pipeline for a CVE and then publishes the resulting report to PatchBook.
+**It provisions nothing on the host**: if Ghidra, a JDK and the Python packages are not present, it
+runs the analysis inside the image built from `Dockerfile`, which already has them.
 
 ```bash
 ./run_and_publish.sh CVE-2026-26179 --from-stage identify        # run + publish
@@ -74,8 +75,26 @@ Everything before its own flags is forwarded verbatim to `run_cve.py`:
 ./run_and_publish.sh CVE-2024-30088 --skip-publish               # pipeline only
 ```
 
-`--publish-commit` and `--skip-publish` are consumed by the wrapper; the CVE id is picked out of the
-arguments (bare id or MSRC URL) for the publish step.
+It picks where to run by itself:
+
+| | when | how |
+|---|---|---|
+| **native** | `ghidriff` and `java` are both available | `run_cve.py` directly |
+| **docker** | otherwise | `docker compose --profile cve run --rm cve …` |
+
+The `cve` compose service mounts the working tree over `/app`, so `run_cve.py` — which the image does
+not `COPY` — and any local edit are used without a rebuild. `DATA_DIR=/data` is bound to `./data`, so
+the blog written inside the container is published from the host afterwards;
+`publish_to_patchbook.py` is standard-library only and needs none of the pipeline's dependencies.
+
+Wrapper-only flags, consumed here and not forwarded: `--docker` / `--native` force a mode,
+`--no-build` skips the image build, `--publish-commit` commits in the submodule, `--skip-publish`
+runs the pipeline only. Everything else goes to `run_cve.py` verbatim. The CVE id is picked out of
+the arguments (bare id or MSRC URL) for the publish step.
+
+Running in Docker needs `.env` (compose declares `env_file: .env`) — copy `.env.example` and fill in
+`ANTHROPIC_API_KEY`. If neither path is available the script says which tools are missing and how to
+install them, rather than failing inside the pipeline with `No such file or directory: 'ghidriff'`.
 
 ### Analysis backends
 
