@@ -79,8 +79,14 @@ It picks where to run by itself:
 
 | | when | how |
 |---|---|---|
-| **native** | `ghidriff` and `java` are both available | `run_cve.py` directly |
+| **native** | `java` is available, and `requirements.txt` is installed or can be | `run_cve.py` directly |
 | **docker** | otherwise | `docker compose --profile cve run --rm cve …` |
+
+If `java` is present but the Python dependencies are not, it runs
+`pip install -r requirements.txt` once and continues natively — `ghidriff` missing is the usual
+symptom, and the whole file is missing along with it. Java decides whether the host is a candidate
+at all, because Ghidra is pure Java and a JDK cannot be pip-installed. Pass `--no-deps` to suppress
+the install.
 
 The `cve` compose service mounts the working tree over `/app`, so `run_cve.py` — which the image does
 not `COPY` — and any local edit are used without a rebuild. `DATA_DIR=/data` is bound to `./data`, so
@@ -88,8 +94,8 @@ the blog written inside the container is published from the host afterwards;
 `publish_to_patchbook.py` is standard-library only and needs none of the pipeline's dependencies.
 
 Wrapper-only flags, consumed here and not forwarded: `--docker` / `--native` force a mode,
-`--no-build` skips the image build, `--publish-commit` commits in the submodule, `--skip-publish`
-runs the pipeline only. Everything else goes to `run_cve.py` verbatim. The CVE id is picked out of
+`--no-build` skips the image build, `--no-deps` suppresses the pip install, `--publish-commit`
+commits in the submodule, `--skip-publish` runs the pipeline only. Everything else goes to `run_cve.py` verbatim. The CVE id is picked out of
 the arguments (bare id or MSRC URL) for the publish step.
 
 Running in Docker needs `.env` (compose declares `env_file: .env`) — copy `.env.example` and fill in
