@@ -7,7 +7,15 @@ RUN apt-get update && apt-get install -y \
     python3 python3-pip python3-venv python3-dev \
     gcc g++ make cmake build-essential \
     sudo bash vim nano less \
+    unzip cabextract \
+    openjdk-21-jdk-headless \
     && rm -rf /var/lib/apt/lists/*
+
+# Ghidra is pure Java, and jpype1/pyghidra compile against the JDK when pip
+# installs them, so the JDK must be in place before requirements.txt below.
+ENV JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64
+# Ghidra itself is bind-mounted by container.sh rather than baked in.
+ENV GHIDRA_INSTALL_DIR=/opt/ghidra
 
 # Node.js 22 (required by Claude Code and Codex)
 RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
@@ -22,6 +30,15 @@ RUN curl -fsSL https://raw.githubusercontent.com/rtk-ai/rtk/refs/heads/master/in
 RUN python3 -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 RUN pip install ipython requests
+
+# The pipeline's own dependencies — ghidriff, the Anthropic SDK, the MCP client
+# and the rest. Installed here so run_cve.py runs natively in this container
+# instead of having to shell out to the pipeline image.
+#
+# The build context is the repo root (see container.sh), not .devcontainer/,
+# which is what makes this COPY possible; .dockerignore keeps that context small.
+COPY requirements.txt /tmp/requirements.txt
+RUN pip install --no-cache-dir -r /tmp/requirements.txt && rm /tmp/requirements.txt
 
 # codex: bypass internal approvals/sandbox inside the container
 RUN CODEX_REAL="$(readlink -f "$(command -v codex)")" \

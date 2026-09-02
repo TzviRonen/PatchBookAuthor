@@ -40,7 +40,10 @@ container_state() {
 
 build_image() {
     echo "[*] Building image '$IMAGE_NAME'..."
-    docker build -t "$IMAGE_NAME" "$WORKSPACE/.devcontainer"
+    # Context is the repo root, not .devcontainer/, so the Dockerfile can COPY
+    # requirements.txt and install the pipeline's dependencies. .dockerignore
+    # keeps that context to a few MB instead of the ~2.2 GB the tree weighs.
+    docker build -t "$IMAGE_NAME" -f "$WORKSPACE/.devcontainer/Dockerfile" "$WORKSPACE"
 }
 
 # Point the container at the host for any IP that lives on a network the docker
