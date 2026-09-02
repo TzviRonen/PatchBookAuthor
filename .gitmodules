@@ -1,0 +1,8 @@
+[submodule "patchbook"]
+	path = patchbook
+	url = git@github.com:TzviRonen/PatchBook.git
+	branch = main
+[submodule "vendor/ghidra-mcp"]
+	path = vendor/ghidra-mcp
+	url = https://github.com/bethington/ghidra-mcp.git
+	branch = main
