@@ -3,7 +3,7 @@
 #
 # This is a thin wrapper around the two development entry points:
 #   1. run_cve.py            — full analysis pipeline (identify + blog)
-#   2. publish_to_patchbook.py — copy the newest blog post into patchbook/_posts/
+#   2. publish_to_patchbook.py — copy the newest blog post into patchbook/_reports/
 #
 # Usage:
 #   ./run_and_publish.sh [run_cve.py options] <CVE-ID | MSRC-URL>

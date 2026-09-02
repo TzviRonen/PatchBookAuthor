@@ -1150,7 +1150,7 @@ _MCP_SESSION_TIMEOUT = 600   # seconds for the full agentic claude -p session
 
 # Local filesystem / shell tools are always denied to the identify and blog agents.
 # The pipeline runs from the repo root, which contains this CVE's own prior writeups
-# (patchbook/_posts/, data/blogs/) and cached verdicts (data/cache/). With
+# (patchbook/_reports/, data/blogs/) and cached verdicts (data/cache/). With
 # --dangerously-skip-permissions the agent could otherwise Read/Grep/Bash those and
 # launder its previous conclusion back in as "analysis". The agent's legitimate inputs
 # are the MCP decompiler and (when allow_web) web search — never local files.

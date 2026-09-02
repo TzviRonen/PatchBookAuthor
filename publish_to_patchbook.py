@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Publish pipeline blog posts to the PatchBook Jekyll site.
+"""Publish pipeline blog posts to the PatchBook Jekyll site as reports.
 
 Usage:
-    python publish_to_patchbook.py              # publish all posts
+    python publish_to_patchbook.py              # publish all reports
     python publish_to_patchbook.py CVE-2024-30088   # publish one CVE
     python publish_to_patchbook.py --commit         # also git commit in patchbook/
 """
@@ -14,7 +14,7 @@ from pathlib import Path
 
 WORKSPACE = Path(__file__).parent
 BLOGS_DIR = WORKSPACE / "data" / "blogs"
-POSTS_DIR = WORKSPACE / "patchbook" / "_posts"
+REPORTS_DIR = WORKSPACE / "patchbook" / "_reports"
 
 # Pipeline-generated header prefix to strip before publishing
 _HEADER_RE = re.compile(
@@ -70,8 +70,12 @@ def _extract_meta(text: str, stem: str) -> dict:
                 title = candidate
                 break
 
+    # Scan for the CVSS score with the <!--meta--> block removed. It sits between
+    # the header and the bullet list that carries the score, and leaving it in
+    # pushed "CVSS" past the 600-character window entirely — every post was
+    # published with no cvss frontmatter, so the severity badge never rendered.
     cvss = ""
-    m = _CVSS_RE.search(body[:600])
+    m = _CVSS_RE.search(_META_RE.sub("", body, count=1).lstrip()[:600])
     if m:
         cvss = m.group(1)
 
@@ -95,10 +99,10 @@ def _extract_meta(text: str, stem: str) -> dict:
 
 
 def _existing_block(dest: Path, key: str) -> list[str]:
-    """Return a named frontmatter block from an already-published post.
+    """Return a named frontmatter block from an already-published report.
 
     Used for `editors:` — the credits readers add to themselves in the pull
-    request that changes a post (see patchbook/_layouts/post.html). Those are
+    request that changes a report (see patchbook/_layouts/report.html). Those are
     human contributions that the pipeline knows nothing about, so re-running
     publish must not wipe them; we carry the existing block forward verbatim.
     Returns the block lines (`<key>:` and its indented items) or [].
@@ -128,7 +132,7 @@ def _existing_block(dest: Path, key: str) -> list[str]:
     return block
 
 
-def _post_date(path: Path) -> datetime:
+def _report_date(path: Path) -> datetime:
     """Derive date from filename timestamp or file mtime."""
     m = _TS_RE.search(path.stem)
     if m:
@@ -139,7 +143,7 @@ def _post_date(path: Path) -> datetime:
     return datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
 
 
-def _select_posts(filter_cve: str | None) -> list[Path]:
+def _select_reports(filter_cve: str | None) -> list[Path]:
     """Return one canonical .md per CVE (prefer base, skip timestamped & .prompt.txt)."""
     if not BLOGS_DIR.exists():
         print(f"[!] Blogs directory not found: {BLOGS_DIR}")
@@ -158,12 +162,12 @@ def _select_posts(filter_cve: str | None) -> list[Path]:
 
     selected = []
     for cve, files in groups.items():
-        # Publish the newest generation for each CVE. Regenerating a post writes a
+        # Publish the newest generation for each CVE. Regenerating a report writes a
         # fresh timestamped file (save_blog_post only reuses the bare name for the
         # very first run), so the latest regeneration must win — otherwise publish
         # would keep re-selecting the stale original base file. Tie-break on the
         # bare (timestamp-less) name so a lone first-run file still selects.
-        newest = max(files, key=lambda f: (_post_date(f), bool(_TS_RE.search(f.stem))))
+        newest = max(files, key=lambda f: (_report_date(f), bool(_TS_RE.search(f.stem))))
         selected.append(newest)
 
     return selected
@@ -178,18 +182,18 @@ def _slug(path: Path) -> str:
 
 
 def publish(filter_cve: str | None = None, do_commit: bool = False) -> None:
-    POSTS_DIR.mkdir(parents=True, exist_ok=True)
-    posts = _select_posts(filter_cve)
+    REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+    reports = _select_reports(filter_cve)
 
-    if not posts:
-        print("[!] No matching posts found.")
+    if not reports:
+        print("[!] No matching reports found.")
         return
 
     published = []
-    for src in posts:
+    for src in reports:
         text = src.read_text(encoding="utf-8")
         meta = _extract_meta(text, src.stem)
-        date = _post_date(src)
+        date = _report_date(src)
 
         if not meta["title"]:
             print(f"[!] Could not extract title from {src.name}, skipping.")
@@ -201,7 +205,7 @@ def publish(filter_cve: str | None = None, do_commit: bool = False) -> None:
 
         frontmatter_lines = [
             "---",
-            f"layout: post",
+            f"layout: report",
             f'title: "{meta["title"].replace(chr(34), chr(39))}"',
             f"date: {date.strftime('%Y-%m-%d')}",
         ]
@@ -215,7 +219,7 @@ def publish(filter_cve: str | None = None, do_commit: bool = False) -> None:
 
         cve_lower = meta["cve_id"].lower() if meta["cve_id"] else ""
         dest_name = f"{date.strftime('%Y-%m-%d')}-{cve_lower}-{_slug(src)}.md"
-        dest = POSTS_DIR / dest_name
+        dest = REPORTS_DIR / dest_name
 
         # carry forward editor credits merged via PR since the last publish
         frontmatter_lines.extend(_existing_block(dest, "editors"))
@@ -223,13 +227,13 @@ def publish(filter_cve: str | None = None, do_commit: bool = False) -> None:
         frontmatter_lines.append("---")
         frontmatter_lines.append("")
         dest.write_text("\n".join(frontmatter_lines) + body, encoding="utf-8")
-        print(f"[+] {src.name}  →  patchbook/_posts/{dest_name}")
+        print(f"[+] {src.name}  →  patchbook/_reports/{dest_name}")
         published.append(meta["cve_id"] or src.stem)
 
     if not published:
         return
 
-    print(f"\n[*] Published {len(published)} post(s).")
+    print(f"\n[*] Published {len(published)} report(s).")
 
     if do_commit:
         patchbook_dir = WORKSPACE / "patchbook"

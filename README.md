@@ -192,7 +192,7 @@ Agent evaluation results are cached per-function in `data/cache/agent_evals/` so
 Finished blog posts can be published to [PatchBook](https://github.com/TzviRonen/PatchBook), a public Jekyll site hosted on GitHub Pages. PatchBook is a git submodule in `patchbook/`.
 
 ```bash
-# publish all posts from data/blogs/ to patchbook/_posts/
+# publish all reports from data/blogs/ to patchbook/_reports/
 python publish_to_patchbook.py
 
 # publish a single CVE

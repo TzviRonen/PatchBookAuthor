@@ -15,9 +15,10 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 # The blog agent writes prose from the context it is handed; it must not read local
-# files. The pipeline runs from the repo root, which holds this CVE's own prior posts
-# (patchbook/_posts/, data/blogs/), so allowing filesystem tools would let the model
-# recycle an earlier writeup instead of working from the supplied decompilation.
+# files. The pipeline runs from the repo root, which holds this CVE's own prior
+# writeups (patchbook/_reports/, data/blogs/), so allowing filesystem tools would let
+# the model recycle an earlier writeup instead of working from the supplied
+# decompilation.
 _DENY_LOCAL_TOOLS = ["Read", "Edit", "Write", "NotebookEdit", "Glob", "Grep", "Bash", "Task"]
 
 _SYSTEM_PROMPT = """\
