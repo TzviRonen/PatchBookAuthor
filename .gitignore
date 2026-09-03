@@ -25,6 +25,7 @@ data/cache/
 data/db/
 data/decomp*/
 data/findings/
+data/logs/
 data/traces/
 data/run_trace.json
 # Raw LLM-input dumps saved next to each report (regenerable, large)
@@ -35,3 +36,5 @@ data/blogs/*.prompt.txt
 *.gbf
 *.i64
 *.pdb
+# scratch
+TOTO.txt

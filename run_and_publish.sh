@@ -29,7 +29,36 @@
 set -euo pipefail
 
 cd "$(dirname "$0")"
-PY=${PYTHON:-python3}
+
+# ── normalise a preset environment ────────────────────────────────────────────
+# The pipeline's LLM calls go through the `claude` CLI, which uses its own OAuth
+# login. A preset ANTHROPIC_API_KEY makes the CLI prefer that key over the login
+# and fail with "Invalid API key", so drop it for the native run (Docker still
+# gets its key via compose's env_file). Set KEEP_ANTHROPIC_API_KEY=1 to override.
+if [ -n "${ANTHROPIC_API_KEY:-}" ] && [ "${KEEP_ANTHROPIC_API_KEY:-0}" != "1" ]; then
+  echo "==> Unsetting preset ANTHROPIC_API_KEY (claude CLI uses OAuth; set KEEP_ANTHROPIC_API_KEY=1 to keep it)" >&2
+  unset ANTHROPIC_API_KEY
+fi
+
+# Pick an interpreter that actually has the pipeline deps. Honour $PYTHON if set;
+# otherwise prefer an active/known virtualenv that ships `ghidriff` beside it, so
+# a bare system python3 (missing the deps) doesn't force the slower Docker path.
+_has_ghidriff_beside() {  # $1 = python executable
+  local exe bindir
+  exe="$("$1" -c 'import sys; print(sys.executable)' 2>/dev/null)" || return 1
+  bindir="$(dirname "$exe")"
+  [ -x "$bindir/ghidriff" ]
+}
+if [ -n "${PYTHON:-}" ]; then
+  PY="$PYTHON"
+else
+  PY=python3
+  for _cand in "${VIRTUAL_ENV:-}/bin/python" /opt/venv/bin/python; do
+    [ -x "$_cand" ] || continue
+    if _has_ghidriff_beside "$_cand"; then PY="$_cand"; break; fi
+  done
+fi
+echo "==> Using interpreter: $PY" >&2
 
 publish_commit=0
 skip_publish=0

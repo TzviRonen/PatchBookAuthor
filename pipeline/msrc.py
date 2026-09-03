@@ -63,7 +63,18 @@ def fetch_vuln_details(cve_id: str) -> dict:
         "publicly_disclosed": d.get("publiclyDisclosed"),
         "title": d.get("cveTitle", ""),
         "description": d.get("unformattedDescription") or d.get("description", ""),
+        "release_number": d.get("releaseNumber", ""),  # e.g. "2026-Aug" — the CVRF update id
     }
+
+
+def find_update_id(cve_id: str) -> str:
+    """Return the CVRF update id (e.g. '2026-Aug') a CVE belongs to, from the SUG API.
+
+    The CVRF /Updates feed lags (it may not list the latest month yet), so resolving
+    the month from the per-CVE SUG record is far more reliable than scanning the feed.
+    Returns "" if unknown.
+    """
+    return fetch_vuln_details(cve_id).get("release_number", "")
 
 
 def fetch_affected_products(cve_id: str) -> list[dict]:

@@ -105,7 +105,7 @@ ensure_running() {
             ;;
         missing)
             read -ra FREE_PORTS < <(find_free_ports 3)
-            PORT_FLAGS=()
+            PORT_FLAGS=(-p "8976:8976")
             for p in "${FREE_PORTS[@]}"; do PORT_FLAGS+=(-p "${p}:${p}"); done
             EXTRA_MOUNTS=()
             if [[ -d "$GHIDRA_DIR" ]]; then

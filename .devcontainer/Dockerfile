@@ -29,6 +29,10 @@ RUN python3 -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 RUN pip install ipython requests
 
+# Owned by root at creation time (USER switches to sandbox below); chown so
+# sandbox can pip install into it later, e.g. requirements.txt via run_and_publish.sh.
+RUN chown -R 1000:1000 /opt/venv
+
 # codex: bypass internal approvals/sandbox inside the container
 RUN CODEX_REAL="$(readlink -f "$(command -v codex)")" \
     && printf '#!/bin/bash\nexec node "%s" --dangerously-bypass-approvals-and-sandbox "$@"\n' "$CODEX_REAL" \

@@ -1452,10 +1452,13 @@ Full candidate list ({len(candidates)} total):
         ]
         if not allow_web:
             cmd += ["--allowedTools", ",".join(backend.allowed_tools())]
-        cmd.append(user_message)
 
+        # Pass the prompt on STDIN, not as a trailing positional: the CLI's
+        # --disallowedTools takes a space-separated list and will otherwise swallow
+        # the prompt's words as bogus deny rules ("rule 'CVE' matches no known tool").
         result = subprocess.run(
             cmd,
+            input=user_message,
             capture_output=True,
             text=True,
             timeout=_MCP_SESSION_TIMEOUT,

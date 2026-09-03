@@ -35,6 +35,20 @@ def _setup_logging() -> None:
 log = logging.getLogger("pipeline.main")
 
 
+def _write_diag_log(cve_id: str, status: str, diagnostics: list[str]) -> None:
+    """Persist per-CVE diagnostics to data/logs/<cve>.log so a run that produced no
+    report is debuggable without querying the DB."""
+    try:
+        logs_dir = config.DATA_DIR / "logs"
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        with open(logs_dir / f"{cve_id}.log", "a", encoding="utf-8") as fh:
+            fh.write(f"\n===== {datetime.utcnow().isoformat()}  {cve_id}  status={status} =====\n")
+            for line in diagnostics:
+                fh.write(line + "\n")
+    except Exception as exc:
+        log.warning("[%s] could not write diagnostics log: %s", cve_id, exc)
+
+
 def _emit_report(cve: dict, binary_name: str, patch_result, target, pre_path,
                  diagnostics: list[str]) -> bool:
     """Generate + save the blog for a validated patch. Returns True on success."""
@@ -53,6 +67,7 @@ def _emit_report(cve: dict, binary_name: str, patch_result, target, pre_path,
                                    title=cve.get("title", ""), prompt=blog_prompt)
         set_cve_status(cve_id, "done", blog_path=str(blog_path))
         set_cve_notes(cve_id, "VALIDATED\n" + "\n".join(diagnostics))
+        _write_diag_log(cve_id, "done", diagnostics)
         log.info("[%s] Done → %s", cve_id, blog_path)
         return True
     except Exception as exc:
@@ -81,6 +96,7 @@ def process_cve(cve: dict, update_id: str) -> None:
     if not targets:
         log.warning("[%s] No affected fixed-build resolved — marking unresolved", cve_id)
         set_cve_status(cve_id, "unresolved", error="no affected fixed-build from MSRC")
+        _write_diag_log(cve_id, "unresolved", ["no affected fixed-build resolved from MSRC affected-product data"])
         return
 
     candidates = candidate_binaries(cve)
@@ -136,6 +152,7 @@ def process_cve(cve: dict, update_id: str) -> None:
     log.warning("[%s] Unresolved after %d attempt(s) — no report emitted", cve_id, len(diagnostics))
     set_cve_status(cve_id, "unresolved", error="no validated patch")
     set_cve_notes(cve_id, "UNRESOLVED\n" + "\n".join(diagnostics))
+    _write_diag_log(cve_id, "unresolved", diagnostics)
 
 
 def run_pipeline() -> None:

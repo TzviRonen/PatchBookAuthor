@@ -38,6 +38,27 @@ logging.basicConfig(
 )
 log = logging.getLogger("run_cve")
 
+# Path of the per-CVE debug log, set once the CVE id is known (see _attach_log_file).
+_LOG_PATH: "Path | None" = None
+
+
+def _attach_log_file(data_dir: Path, cve_id: str) -> Path:
+    """Tee all logging (this run and every pipeline module) to data/logs/<cve>.log.
+
+    Appended, with a per-run header, so a run that exits WITHOUT a report still
+    leaves a full, debuggable trace (identify verdicts, validation reasons, errors).
+    """
+    global _LOG_PATH
+    logs_dir = data_dir / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    _LOG_PATH = logs_dir / f"{cve_id}.log"
+    fh = logging.FileHandler(_LOG_PATH, encoding="utf-8")
+    fh.setLevel(logging.INFO)
+    fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)-8s %(name)s: %(message)s"))
+    logging.getLogger().addHandler(fh)  # root: captures run_cve + all pipeline.* loggers
+    log.info("===== run %s  args=%s =====", cve_id, " ".join(sys.argv[1:]))
+    return _LOG_PATH
+
 
 def _print(step: int, total: int, label: str, detail: str = "") -> None:
     tag = f"[{step}/{total}]"
@@ -46,7 +67,10 @@ def _print(step: int, total: int, label: str, detail: str = "") -> None:
 
 
 def _fail(msg: str) -> None:
+    log.error(msg)  # lands in the per-CVE log file for debugging
     print(f"\n  ERROR: {msg}", file=sys.stderr)
+    if _LOG_PATH is not None:
+        print(f"  See log: {_LOG_PATH}", file=sys.stderr)
     sys.exit(1)
 
 
@@ -109,6 +133,22 @@ def find_update_for_cve(cve_id: str) -> tuple[str, dict]:
     Searches year-1 through year+1 (most recent first) to handle CVEs
     disclosed in one year but patched in an adjacent year.
     """
+    # Authoritative first: ask the SUG API which monthly update this CVE belongs to.
+    # The CVRF /Updates feed lags (often missing the newest month), so scanning it
+    # fails for freshly released CVEs even though their CVRF document exists.
+    from pipeline.msrc import find_update_id
+    sug_uid = find_update_id(cve_id)
+    if sug_uid:
+        try:
+            cvrf = fetch_cvrf(sug_uid)
+            for cve in iter_cves(cvrf):
+                if cve["id"].upper() == cve_id.upper():
+                    log.info("Resolved %s to update %s via SUG API", cve_id, sug_uid)
+                    return sug_uid, cve
+        except Exception as e:
+            log.warning("SUG-resolved update %s fetch failed: %s — falling back to feed scan",
+                        sug_uid, e)
+
     year = _cve_year(cve_id)
     # Fetch all updates without a date filter — we filter by ID year below
     # (CurrentReleaseDate is unreliable: MSRC bumps it on every revision)
@@ -552,7 +592,8 @@ def main() -> None:
     cve_id = _parse_cve_id(args.cve)
     data_dir = Path(args.data_dir)
 
-    print(f"\nkernal-cve-pipeline  ·  {cve_id}\n")
+    log_path = _attach_log_file(data_dir, cve_id)
+    print(f"\nkernal-cve-pipeline  ·  {cve_id}   (log: {log_path})\n")
 
     # --from-stage: clear that stage and all subsequent ones
     if args.from_stage:
