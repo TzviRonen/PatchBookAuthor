@@ -492,7 +492,8 @@ def run(cve_id: str, update_id: str | None, data_dir: Path, force: bool,
                 cve, binary_name,
                 patch_result=patch_result,
                 versions={"pre_build": pre_build, "post_build": post_build,
-                          "lineage": target.lineage},
+                          "lineage": target.lineage,
+                          "patch_date": ground_truth.get("release_date", "")},
             )
         except Exception as e:
             _fail(f"Blog generation failed: {e}")

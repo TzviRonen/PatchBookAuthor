@@ -24,6 +24,9 @@ _HEADER_RE = re.compile(
 _CVE_RE    = re.compile(r"^(CVE-\d{4}-\d+)", re.IGNORECASE)
 _TITLE_RE  = re.compile(r"^# (.+)$", re.MULTILINE)
 _CVSS_RE   = re.compile(r"CVSS[^0-9]*([\d]+\.[0-9])")
+# Patch (Patch Tuesday) date the pipeline stamps into the metadata box. The report's
+# published date is keyed off this — the date the fix shipped, not when we wrote the report.
+_PATCHDATE_RE = re.compile(r"\*\*Patch date:\*\*\s*(\d{4}-\d{2}-\d{2})")
 _TS_RE     = re.compile(r"_(\d{8}T\d{6})$")  # stem suffix like _20260610T205532
 # Machine-readable block the blog generator emits at the very top of the post:
 #   <!--meta
@@ -95,7 +98,11 @@ def _extract_meta(text: str, stem: str) -> dict:
             break
     excerpt = excerpt[:300]
 
-    return {"cve_id": cve_id, "title": title, "cvss": cvss, "excerpt": excerpt}
+    m = _PATCHDATE_RE.search(body)
+    patch_date = m.group(1) if m else ""
+
+    return {"cve_id": cve_id, "title": title, "cvss": cvss, "excerpt": excerpt,
+            "patch_date": patch_date}
 
 
 def _existing_block(dest: Path, key: str) -> list[str]:
@@ -193,7 +200,9 @@ def publish(filter_cve: str | None = None, do_commit: bool = False) -> None:
     for src in reports:
         text = src.read_text(encoding="utf-8")
         meta = _extract_meta(text, src.stem)
-        date = _report_date(src)
+        # Prefer the patch (Patch Tuesday) date from the report over the file's
+        # generation date, so the site's dates/graph reflect when the fix shipped.
+        date_str = meta.get("patch_date") or _report_date(src).strftime("%Y-%m-%d")
 
         if not meta["title"]:
             print(f"[!] Could not extract title from {src.name}, skipping.")
@@ -207,7 +216,7 @@ def publish(filter_cve: str | None = None, do_commit: bool = False) -> None:
             "---",
             f"layout: report",
             f'title: "{meta["title"].replace(chr(34), chr(39))}"',
-            f"date: {date.strftime('%Y-%m-%d')}",
+            f"date: {date_str}",
         ]
         if meta["cve_id"]:
             frontmatter_lines.append(f"cve_id: {meta['cve_id']}")
@@ -218,7 +227,7 @@ def publish(filter_cve: str | None = None, do_commit: bool = False) -> None:
             frontmatter_lines.append(f'excerpt: "{safe_excerpt}"')
 
         cve_lower = meta["cve_id"].lower() if meta["cve_id"] else ""
-        dest_name = f"{date.strftime('%Y-%m-%d')}-{cve_lower}-{_slug(src)}.md"
+        dest_name = f"{date_str}-{cve_lower}-{_slug(src)}.md"
         dest = REPORTS_DIR / dest_name
 
         # carry forward editor credits merged via PR since the last publish

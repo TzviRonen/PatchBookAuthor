@@ -120,6 +120,11 @@ def _metadata_box(
 
     lines.append(f"- **CVE:** {cve['id']}")
 
+    # Patch (Patch Tuesday release) date — the date the fix shipped, distinct from when
+    # this report was generated. Publishing keys the report's date off this.
+    if versions and versions.get("patch_date"):
+        lines.append(f"- **Patch date:** {versions['patch_date']}")
+
     if cve.get("cvss"):
         lines.append(f"- **CVSS:** {cve['cvss']}")
 

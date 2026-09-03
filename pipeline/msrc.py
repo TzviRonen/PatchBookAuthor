@@ -64,6 +64,8 @@ def fetch_vuln_details(cve_id: str) -> dict:
         "title": d.get("cveTitle", ""),
         "description": d.get("unformattedDescription") or d.get("description", ""),
         "release_number": d.get("releaseNumber", ""),  # e.g. "2026-Aug" — the CVRF update id
+        # Patch Tuesday release date (the date the fix shipped), e.g. "2026-06-09".
+        "release_date": (d.get("releaseDate", "") or "")[:10],
     }
 
 

@@ -50,7 +50,7 @@ def _write_diag_log(cve_id: str, status: str, diagnostics: list[str]) -> None:
 
 
 def _emit_report(cve: dict, binary_name: str, patch_result, target, pre_path,
-                 diagnostics: list[str]) -> bool:
+                 diagnostics: list[str], patch_date: str = "") -> bool:
     """Generate + save the blog for a validated patch. Returns True on success."""
     cve_id = cve["id"]
     # _download_binary names files "<binary>.<revision>"; recover the pre revision.
@@ -58,7 +58,8 @@ def _emit_report(cve: dict, binary_name: str, patch_result, target, pre_path,
     m = re.search(r"\.(\d+)$", pre_path.name)
     if m:
         pre_rev = int(m.group(1))
-    versions = {"pre_build": pre_rev, "post_build": target.revision, "lineage": target.lineage}
+    versions = {"pre_build": pre_rev, "post_build": target.revision, "lineage": target.lineage,
+                "patch_date": patch_date}
     try:
         blog_text, blog_prompt = generate_blog_post(
             cve, binary_name, patch_result=patch_result, versions=versions,
@@ -145,7 +146,8 @@ def process_cve(cve: dict, update_id: str) -> None:
                 continue
 
             log.info("[%s] VALIDATED %s in %s", cve_id, patch_result.function_name, tag)
-            if _emit_report(cve, binary_name, patch_result, target, pre_path, diagnostics):
+            if _emit_report(cve, binary_name, patch_result, target, pre_path, diagnostics,
+                            patch_date=ground_truth.get("release_date", "")):
                 return
 
     # Nothing validated across all targets × binaries → do NOT publish anything.
