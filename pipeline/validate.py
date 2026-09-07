@@ -15,17 +15,21 @@ import re
 
 from pipeline.patch_identifier import (
     PatchResult, _real_change_counts, _SECURITY_FIX_PATTERNS, _extract_feature_flags,
-    _cve_primary_classes,
+    _cve_primary_classes, _cve_acceptable_classes, _class_compatible,
 )
 
 log = logging.getLogger(__name__)
 
 # agent patch_type -> acceptable CWE numbers for that class
+# A race condition (CWE-362) is a root cause whose fix commonly reads as a UAF/double-free
+# repair, so both TOCTOU and use_after_free are consistent with a CVE that carries CWE-362.
+# This only governs the fallback path below, used when the MSRC description does not name a
+# class; the description path uses the richer _cve_acceptable_classes relation.
 _PATCH_TYPE_CWES: dict[str, set[int]] = {
-    "use_after_free": {416, 415, 825},
+    "use_after_free": {416, 415, 825, 362},
     "buffer_overflow": {122, 121, 787, 788, 120, 680, 190, 191, 125},
     "info_leak": {200, 908, 457, 125, 908},
-    "TOCTOU": {367},
+    "TOCTOU": {367, 362},
     "null_deref": {476},
     "EoP": {269, 266, 264, 268, 250},
     "other": set(),   # matches anything
@@ -78,15 +82,24 @@ def validate_patch(cve: dict, ground_truth: dict, patch: PatchResult) -> tuple[b
     #    22621 tcpip.sys has both the 45657 UAF and the 42904 overflow, and 45657 lists BOTH
     #    CWE-416 and CWE-122, so the broad CWE check alone would wrongly accept the overflow.
     #    Falls back to the broad CWE map only when the description does not name a class.
-    primary = _cve_primary_classes({**cve, "cwe_list": ground_truth.get("cwe_list", [])})
+    cve_for_class = {**cve, "cwe_list": ground_truth.get("cwe_list", [])}
+    primary = _cve_primary_classes(cve_for_class)
+    acceptable = _cve_acceptable_classes(cve_for_class)
     cve_cwes = _cwe_numbers(ground_truth.get("cwe_list", []))
     if primary:
-        if patch.patch_type in primary:
-            reasons.append(f"ok class: patch_type={patch.patch_type} matches stated {sorted(primary)}")
+        # Accept the stated class *or* a fix manifestation compatible with it (e.g. a race
+        # patched as a UAF), while still rejecting an unrelated co-shipped fix (an overflow).
+        if _class_compatible(patch.patch_type, acceptable):
+            reasons.append(
+                f"ok class: patch_type={patch.patch_type} matches stated {sorted(primary)}"
+                + (f" (as manifestation; accepts {sorted(acceptable)})"
+                   if patch.patch_type not in primary else "")
+            )
         else:
             ok = False
             reasons.append(
-                f"FAIL class: patch_type={patch.patch_type} != CVE stated class {sorted(primary)}"
+                f"FAIL class: patch_type={patch.patch_type} != CVE stated class {sorted(primary)} "
+                f"(accepts {sorted(acceptable)})"
             )
     elif _cwe_consistent(patch.patch_type, cve_cwes):
         reasons.append(f"ok cwe: patch_type={patch.patch_type} vs {sorted(cve_cwes) or 'n/a'}")

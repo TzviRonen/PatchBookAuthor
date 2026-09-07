@@ -362,7 +362,12 @@ def _extract_cve_keywords(cve: dict) -> list[str]:
 _DESC_CLASS_PATTERNS = [
     (re.compile(r"use[\s-]?after[\s-]?free", re.I), "use_after_free"),
     (re.compile(r"heap[\s-]?based buffer overflow|buffer overflow|out[\s-]?of[\s-]?bounds write|stack[\s-]?based buffer overflow", re.I), "buffer_overflow"),
-    (re.compile(r"time[\s-]?of[\s-]?check|toctou|race condition", re.I), "TOCTOU"),
+    # Race family. MSRC phrases these several ways — "race condition", the CWE-362
+    # long form "concurrent execution using shared resource with improper
+    # synchronization", or just "improper synchronization" — so match all of them,
+    # not only the parenthetical "race condition". All resolve to TOCTOU, the agent
+    # patch_type token that stands for the whole race family (see _CLASS_MANIFESTATIONS).
+    (re.compile(r"time[\s-]?of[\s-]?check|toctou|race condition|concurrent execution|improper synchronization", re.I), "TOCTOU"),
     (re.compile(r"out[\s-]?of[\s-]?bounds read|information disclosure|buffer over[\s-]?read|uninitialized", re.I), "info_leak"),
     (re.compile(r"null[\s-]?pointer dereference", re.I), "null_deref"),
 ]
@@ -370,8 +375,24 @@ _CWE_CLASS = {
     416: "use_after_free", 415: "use_after_free",
     122: "buffer_overflow", 121: "buffer_overflow", 787: "buffer_overflow",
     120: "buffer_overflow", 190: "buffer_overflow", 191: "buffer_overflow",
-    367: "TOCTOU", 476: "null_deref",
+    362: "TOCTOU", 367: "TOCTOU", 476: "null_deref",
     200: "info_leak", 908: "info_leak", 457: "info_leak", 125: "info_leak",
+}
+
+# A CVE's stated bug class is its *root cause*; the fix that closes it often reads as a
+# different mechanic. A race condition (CWE-362/-367) is the clearest case: the repair
+# routinely manifests as a use-after-free / double-free fix — an idempotent unlink, a
+# refcount made atomic, or a state flag guarding an object across a dropped lock. So a
+# patch the agent labels `use_after_free` is a legitimate fix for a race CVE, and must
+# not be rejected merely for being named by its manifestation. (This is why the pipeline
+# first rejected the correct InetWakeAcquirePortAf fix for CVE-2026-54999.)
+#
+# Deliberately one-directional and narrow: a race accepts a UAF/double-free fix, but a
+# stated UAF does NOT broaden to buffer_overflow — that asymmetry is what still lets the
+# class check reject a co-shipped overflow fix sharing the same build (the 45657 vs 42904
+# case _cve_primary_classes was built for).
+_CLASS_MANIFESTATIONS: dict[str, set[str]] = {
+    "TOCTOU": {"use_after_free", "double_free"},
 }
 
 
@@ -392,6 +413,25 @@ def _cve_primary_classes(cve: dict) -> set[str]:
         if m and int(m.group(1)) in _CWE_CLASS:
             from_cwe.add(_CWE_CLASS[int(m.group(1))])
     return from_cwe
+
+
+def _cve_acceptable_classes(cve: dict) -> set[str]:
+    """The stated class(es) plus every fix manifestation compatible with them.
+
+    This is what identify and validate should test a candidate's patch_type against:
+    it keeps the disambiguation power of the stated class while accepting a fix that
+    reads as a compatible manifestation (a race patched as a UAF/double-free). Empty
+    set means "unknown" — callers must not filter by class.
+    """
+    acceptable = set(_cve_primary_classes(cve))
+    for cls in list(acceptable):
+        acceptable |= _CLASS_MANIFESTATIONS.get(cls, set())
+    return acceptable
+
+
+def _class_compatible(patch_type: str, acceptable: set[str]) -> bool:
+    """True if patch_type is acceptable for the CVE (or the CVE class is unknown)."""
+    return (not acceptable) or (patch_type in acceptable)
 
 
 def _detect_bug_class(cve: dict) -> list[str]:
@@ -1015,8 +1055,10 @@ def identify_patch(cve: dict, diff_path: Path) -> PatchResult:
     best_positive: tuple[AgentEval, FunctionSection] | None = None
     best_class_match: tuple[AgentEval, FunctionSection] | None = None
     primary_classes = _cve_primary_classes(cve)
+    acceptable_classes = _cve_acceptable_classes(cve)
     if primary_classes:
-        log.info("CVE primary bug class(es): %s", ", ".join(sorted(primary_classes)))
+        log.info("CVE bug class(es): stated=%s accepts=%s",
+                 ", ".join(sorted(primary_classes)), ", ".join(sorted(acceptable_classes)))
     cve_id = cve.get("id", "unknown")
 
     for i, scored_sec in enumerate(candidates):
@@ -1043,7 +1085,7 @@ def identify_patch(cve: dict, diff_path: Path) -> PatchResult:
         # A candidate whose bug class conflicts with the CVE's stated class must NOT be
         # accepted just because the agent is confident — that is how 42904's overflow got
         # attributed to 45657. Only auto-accept a high-confidence match of the right class.
-        matches_class = (not primary_classes) or (eval_result.patch_type in primary_classes)
+        matches_class = _class_compatible(eval_result.patch_type, acceptable_classes)
 
         if (eval_result.is_patch and eval_result.confidence >= CONFIDENCE_THRESHOLD
                 and matches_class):
