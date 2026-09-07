@@ -38,3 +38,6 @@ data/blogs/*.prompt.txt
 *.pdb
 # scratch
 TOTO.txt
+
+# Cron slot bookkeeping (runtime only)
+cron/state/

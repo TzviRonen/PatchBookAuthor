@@ -1,0 +1,21 @@
+# Work list for cron/run-slot.sh — one CVE id per line, `#` comments allowed.
+#
+# This file is never mutated by the job; progress is tracked in
+# cron/state/done.txt, failed.txt and attempts.txt. To requeue a CVE, remove
+# its line from cron/state/done.txt.
+#
+# Seeded from TOTO.txt: latest 20 Windows kernel / kernel-mode-driver CVEs
+# (RCE or EoP, CVSS >= 8), as of 2026-09-02. Order is the order they run in.
+
+CVE-2026-54999
+CVE-2026-50477
+CVE-2026-49798
+CVE-2026-49795
+CVE-2026-49184
+CVE-2026-42975
+CVE-2026-50687
+CVE-2026-50670
+CVE-2026-50489
+CVE-2026-50382
+CVE-2026-54107
+CVE-2026-34332
