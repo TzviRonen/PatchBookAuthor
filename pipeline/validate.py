@@ -14,11 +14,42 @@ import logging
 import re
 
 from pipeline.patch_identifier import (
-    PatchResult, _real_change_counts, _SECURITY_FIX_PATTERNS, _extract_feature_flags,
+    PatchResult, _real_change_counts, _SECURITY_FIX_PATTERNS,
     _cve_primary_classes, _cve_acceptable_classes, _class_compatible,
 )
 
 log = logging.getLogger(__name__)
+
+# A published report drives an unattended commit+push to the live site, so a
+# low-confidence identify result must not reach it. 60 mirrors the pipeline's own
+# FALLBACK_CONFIDENCE_THRESHOLD (the floor at which identify accepts a best guess).
+MIN_PUBLISH_CONFIDENCE = 60
+
+_FEATURE_GATE_RE = re.compile(r"Feature_\d+__private_IsEnabled", re.I)
+
+
+def _diff_added_removed(diff_text: str) -> tuple[list[str], list[str]]:
+    """Split a unified diff into its added and removed source lines (markers stripped)."""
+    added, removed = [], []
+    for line in diff_text.splitlines():
+        if line.startswith("+") and not line.startswith("++"):
+            added.append(line[1:])
+        elif line.startswith("-") and not line.startswith("--"):
+            removed.append(line[1:])
+    return added, removed
+
+
+def _gate_direction(diff_text: str) -> tuple[bool, bool]:
+    """Return (gate_added, gate_removed) for CFR Feature_* killswitches in the diff.
+
+    Direction is the whole point (see docs/agent-memory.md, Feature_* rules): a gate
+    *added* around new logic is the live fix (Rule 2); a gate *removed* is rollout
+    completion / cleanup of a fix that shipped earlier (Rule 1), not a fix itself.
+    """
+    added, removed = _diff_added_removed(diff_text)
+    gate_added = any(_FEATURE_GATE_RE.search(l) for l in added)
+    gate_removed = any(_FEATURE_GATE_RE.search(l) for l in removed)
+    return gate_added, gate_removed
 
 # agent patch_type -> acceptable CWE numbers for that class
 # A race condition (CWE-362) is a root cause whose fix commonly reads as a UAF/double-free
@@ -55,10 +86,17 @@ def _cwe_consistent(patch_type: str, cve_cwes: set[int]) -> bool:
 
 
 def _has_security_signal(diff_text: str) -> bool:
-    """True if the diff shows a recognizable security fix (not a benign refactor)."""
-    if _SECURITY_FIX_PATTERNS.search(diff_text):
+    """True if the *added* code shows a recognizable security fix (not a benign refactor).
+
+    Evaluated on added lines only: the fix is what the patch introduces. A gate merely
+    *present* in the diff is not enough — an added gate counts (Rule 2), a removed one
+    does not (Rule 1, handled by the cleanup-only check in validate_patch).
+    """
+    added, _ = _diff_added_removed(diff_text)
+    added_text = "\n".join(added)
+    if _SECURITY_FIX_PATTERNS.search(added_text):
         return True
-    if _extract_feature_flags(diff_text):
+    if _FEATURE_GATE_RE.search(added_text):
         return True  # a newly added Feature_* gate is the staged-rollout fix signature
     return False
 
@@ -68,6 +106,17 @@ def validate_patch(cve: dict, ground_truth: dict, patch: PatchResult) -> tuple[b
     reasons: list[str] = []
     ok = True
 
+    # 0. Confidence floor. A published report is pushed to the live site unattended,
+    #    so a low-confidence guess must never reach it. Applies to every identify path
+    #    (the MCP path had no floor of its own — a 45% pick reached publish once).
+    if patch.confidence < MIN_PUBLISH_CONFIDENCE:
+        ok = False
+        reasons.append(
+            f"FAIL confidence: {patch.confidence}% < {MIN_PUBLISH_CONFIDENCE}% publish floor"
+        )
+    else:
+        reasons.append(f"ok confidence: {patch.confidence}%")
+
     # 1. Real change present (defence in depth — candidates are pre-filtered, but a
     #    fallback-confidence match could still be relocation noise).
     added, removed = _real_change_counts(patch.full_diff)
@@ -76,6 +125,21 @@ def validate_patch(cve: dict, ground_truth: dict, patch: PatchResult) -> tuple[b
         reasons.append("FAIL real-change: diff is relocation/metadata only")
     else:
         reasons.append(f"ok real-change: +{added}/-{removed} normalized")
+
+    # 1b. Cleanup-only delta: the change only *removes* a Feature_* killswitch, with no
+    #     gate added and no recognizable fix pattern in the added lines. That is CFR
+    #     rollout completion (Rule 1) — the real fix shipped earlier or in another binary,
+    #     so this binary carries no fix to publish. (This is what let a gate-removal in
+    #     ntoskrnl.exe be published while the real UAF fix sat in an undiffed driver.)
+    gate_added, gate_removed = _gate_direction(patch.full_diff)
+    has_signal = _has_security_signal(patch.full_diff)
+    if gate_removed and not gate_added and not has_signal:
+        ok = False
+        reasons.append(
+            "FAIL cleanup-only: diff only removes a Feature_* killswitch (CFR rollout "
+            "completion), no fix added — the real fix is elsewhere (earlier build or "
+            "another binary)"
+        )
 
     # 2. Bug-class consistency. Prefer the CVE's *stated* class (from the MSRC description),
     #    which disambiguates when one build's diff carries several co-shipped fixes — e.g.
@@ -109,12 +173,14 @@ def validate_patch(cve: dict, ground_truth: dict, patch: PatchResult) -> tuple[b
             f"FAIL cwe: patch_type={patch.patch_type} inconsistent with CVE CWEs {sorted(cve_cwes)}"
         )
 
-    # 3. Security-fix signal (soft — recorded, not fatal, to avoid rejecting real fixes
-    #    whose pattern we don't recognize).
-    if _has_security_signal(patch.full_diff):
-        reasons.append("ok signal: security-fix pattern / Feature_* gate present")
+    # 3. Positive security-fix signal in the added code. Soft on its own (recorded, not
+    #    fatal) so we don't reject a real fix whose pattern we simply don't recognize —
+    #    but it feeds the cleanup-only gate above, and "an added gate" now requires the
+    #    gate to be *added*, not merely mentioned. (has_signal computed in 1b.)
+    if has_signal:
+        reasons.append("ok signal: security-fix pattern / added Feature_* gate in added code")
     else:
-        reasons.append("warn signal: no recognized security-fix pattern (soft)")
+        reasons.append("warn signal: no recognized security-fix pattern in added code (soft)")
 
     # 4. Attack-vector plausibility (soft). AV:N/AV:A CVEs should land in reachable code;
     #    we only warn because callgraph reachability isn't available at this layer.
