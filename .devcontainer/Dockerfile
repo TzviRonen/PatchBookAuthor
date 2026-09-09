@@ -8,6 +8,7 @@ RUN apt-get update && apt-get install -y \
     gcc g++ make cmake build-essential \
     sudo bash vim nano less \
     openjdk-21-jdk-headless \
+    cron jq \
     && rm -rf /var/lib/apt/lists/*
 
 # Ghidra is pure Java and will not start without a JDK. Ghidra itself is not in
