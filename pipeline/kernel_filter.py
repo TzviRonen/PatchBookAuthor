@@ -47,6 +47,15 @@ _GENERIC_KERNEL_FALLBACK = [
 ]
 _NETWORK_HINT = re.compile(r"over a network|network|remote|tcp/?ip|udp|packet|ipv[46]", re.I)
 
+# Fallback set for a generic *local* kernel CVE ("Windows Kernel ... elevate privileges
+# locally"). These EoP/UAF bugs frequently live in a kernel driver rather than ntoskrnl.exe
+# itself (clfs.sys is a perennial local-EoP UAF surface), and the ntoskrnl.exe delta for the
+# month is often only CFR-gate cleanup. ntoskrnl.exe stays first, then the common drivers —
+# the research loop moves on to these when ntoskrnl.exe does not validate.
+_GENERIC_KERNEL_LOCAL_FALLBACK = [
+    "ntoskrnl.exe", "clfs.sys", "cng.sys", "ntfs.sys", "fastfat.sys", "ksecdd.sys",
+]
+
 
 def candidate_binaries(cve: dict) -> list[str]:
     """Return a ranked list of candidate binaries to diff for *cve* (empty if not kernel).
@@ -76,5 +85,12 @@ def candidate_binaries(cve: dict) -> list[str]:
                 ranked.append(b)
         if "ntoskrnl.exe" in ranked:
             ranked = [b for b in ranked if b != "ntoskrnl.exe"] + ["ntoskrnl.exe"]
+    elif ranked == ["ntoskrnl.exe"]:
+        # Only the generic "Windows Kernel" rule matched (no specific driver, not network):
+        # a local kernel EoP/UAF whose fix may sit in a driver. Keep ntoskrnl.exe first, then
+        # the common local-EoP drivers so the loop can try them when ntoskrnl.exe declines.
+        for b in _GENERIC_KERNEL_LOCAL_FALLBACK:
+            if b not in ranked:
+                ranked.append(b)
     return ranked
 

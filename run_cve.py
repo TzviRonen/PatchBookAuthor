@@ -248,223 +248,230 @@ def run(cve_id: str, update_id: str | None, data_dir: Path, force: bool,
     print(f"       Targets:    {[f'{t.lineage}.{t.revision}' for t in targets]}")
     print(f"       CWE:        {ground_truth.get('cwe_list')}")
 
-    # ── Step 2: Select target + download binaries ──────────────────────────────
-    _print(2, TOTAL_STEPS, "Downloading binaries...")
-
-    cached = trace.get("binaries")
-    if cached:
-        pre_path = Path(cached["pre_path"])
-        post_path = Path(cached["post_path"])
-        binary_name = cached["binary_name"]
-        target = next(t for t in targets if t.lineage == cached["lineage"])
-        _print(2, TOTAL_STEPS, "Binaries (cached)",
-               f"{binary_name} pre={cached['pre_build']} post={cached['post_build']}")
-    else:
-        binaries_dir = data_dir / "binaries" / cve_id
-        # First (target lineage × candidate binary) that actually shipped this fix build.
-        pick = next(((t, b) for t in targets for b in candidates
-                     if has_target(b, t.lineage, t.revision)), None)
-        if pick is None:
-            _fail(f"{cve_id}: none of {candidates} shipped a build for targets "
-                  f"{[f'{t.lineage}.{t.revision}' for t in targets]}")
-        target, binary_name = pick
-        try:
-            pre_path, post_path = get_binary_pair_for_target(
-                binary_name, target.lineage, target.revision, binaries_dir,
-            )
-        except Exception as e:
-            _fail(f"Binary download failed: {e}")
-
-        pre_build = int(pre_path.suffix.lstrip("."))
-        post_build = int(post_path.suffix.lstrip("."))
-        _print(2, TOTAL_STEPS, "Binaries",
-               f"{binary_name} pre={pre_build} post={post_build} lineage={target.lineage}")
-        trace.save("binaries", {
-            "pre_path": str(pre_path), "post_path": str(post_path),
-            "pre_build": pre_build, "post_build": post_build,
-            "binary_name": binary_name, "lineage": target.lineage,
-        })
-
-    # Build numbers, needed by the blog metadata box. Derived from the file
-    # suffix so both the cached and freshly-downloaded paths agree.
-    pre_build = int(pre_path.suffix.lstrip("."))
-    post_build = int(post_path.suffix.lstrip("."))
-
-    # ── Step 3: Ghidriff (+ concurrent MCP server startup) ────────────────────
-    _print(3, TOTAL_STEPS, "Running ghidriff (20-40 min)...")
-
-    mcp_server = None
+    # ── Steps 2-4b: try candidate binaries until one validates ─────────────────
+    # The fix for a generic "Windows Kernel" CVE often lives in a driver, not the first
+    # candidate, and a binary's month-over-month delta can be pure CFR cleanup. Rather
+    # than diff everything up front, diff ONE binary, identify, and validate; if the
+    # validator declines, move on to the next candidate binary and repeat. Only give up
+    # when every candidate has been tried.
+    binaries_dir = data_dir / "binaries" / cve_id
+    diffs_dir = data_dir / "diffs"
     want_ghidra_mcp = backend == "ghidra"
-    cached = trace.get("ghidriff")
-    if cached:
-        diff_path = Path(cached["diff_path"])
-        _print(3, TOTAL_STEPS, "Ghidriff (cached)",
-               f"{cached['function_count']} changed functions")
-        # Diff is cached — still start MCP if identify stage will need it
-        if want_ghidra_mcp and not trace.get("identify"):
-            from pipeline.ghidriff_runner import _start_mcp_background, _GHIDRA_PROJECTS_DIR
-            _base = f"ghidriff_{cve_id.replace('/', '-')}"
-            _proj_name = f"{_base}-{pre_path.name}-{post_path.name}"
-            _proj_dir = _GHIDRA_PROJECTS_DIR / _proj_name
-            _rep_idata = _proj_dir / f"{_proj_name}.rep" / "idata"
-            _gbf_files = list(_rep_idata.rglob("*.gbf")) if _rep_idata.is_dir() else []
-            _project_ready = bool(_gbf_files) and any(
-                f.stat().st_size > 10 * 1024 * 1024 for f in _gbf_files
-            )
-            mcp_server = _start_mcp_background(
-                pre_path, post_path,
-                project_dir=_proj_dir if _project_ready else None,
-                project_name=_proj_name,
-            )
-    else:
-        diffs_dir = data_dir / "diffs"
-        diff_name = cve_id.replace("/", "-")
-        try:
-            diff_path, mcp_server = run_ghidriff(pre_path, post_path, diffs_dir, diff_name,
-                                                 start_mcp=want_ghidra_mcp)
-        except Exception as e:
-            _fail(f"Ghidriff failed: {e}")
 
-        from pipeline.patch_identifier import parse_ghidriff_sections
-        fn_count = len(parse_ghidriff_sections(diff_path))
-        _print(3, TOTAL_STEPS, "Ghidriff",
-               f"{fn_count} changed functions → {diff_path.name}")
-        trace.save("ghidriff", {
-            "diff_path": str(diff_path),
-            "function_count": fn_count,
-        })
+    def _target_for(b):
+        return next((t for t in targets if has_target(b, t.lineage, t.revision)), None)
 
-    # ── Step 4: Identify patch ─────────────────────────────────────────────────
-    _print(4, TOTAL_STEPS, "Identifying patch function...")
+    work = [(b, _target_for(b)) for b in candidates]
+    work = [(b, t) for b, t in work if t is not None]
+    if not work:
+        _fail(f"{cve_id}: none of {candidates} shipped a build for targets "
+              f"{[f'{t.lineage}.{t.revision}' for t in targets]}")
+
+    # Resume: if a binary's stages are already cached from a prior run, try it first so its
+    # cached download/diff/identify are reused rather than recomputed.
+    _cached_bin = (trace.get("binaries") or {}).get("binary_name")
+    if _cached_bin in {b for b, _ in work}:
+        work.sort(key=lambda bt: bt[0] != _cached_bin)
+
+    def _attempt(binary_name, target, reuse):
+        """Download + ghidriff + identify one binary.
+
+        Returns (patch_result, diff_path, pre_build, post_build) on success, or None to
+        skip this binary (download/diff/identify failed — try the next candidate).
+        Owns the backend/MCP lifecycle for its identify step.
+        """
+        # ── download pair ──
+        if reuse and trace.get("binaries"):
+            c = trace.get("binaries")
+            pre_path = Path(c["pre_path"]); post_path = Path(c["post_path"])
+            _print(2, TOTAL_STEPS, "Binaries (cached)",
+                   f"{binary_name} pre={c['pre_build']} post={c['post_build']}")
+        else:
+            try:
+                pre_path, post_path = get_binary_pair_for_target(
+                    binary_name, target.lineage, target.revision, binaries_dir)
+            except Exception as e:
+                print(f"  [!] {binary_name}: binary download failed ({str(e)[:120]})", flush=True)
+                return None
+            trace.save("binaries", {
+                "pre_path": str(pre_path), "post_path": str(post_path),
+                "pre_build": int(pre_path.suffix.lstrip('.')),
+                "post_build": int(post_path.suffix.lstrip('.')),
+                "binary_name": binary_name, "lineage": target.lineage})
+            _print(2, TOTAL_STEPS, "Binaries",
+                   f"{binary_name} pre={pre_path.suffix.lstrip('.')} "
+                   f"post={post_path.suffix.lstrip('.')} lineage={target.lineage}")
+        pre_build = int(pre_path.suffix.lstrip('.'))
+        post_build = int(post_path.suffix.lstrip('.'))
+
+        # ── ghidriff (+ concurrent MCP startup) ──
+        mcp_server = None
+        cached = trace.get("ghidriff") if reuse else None
+        if cached:
+            diff_path = Path(cached["diff_path"])
+            _print(3, TOTAL_STEPS, "Ghidriff (cached)",
+                   f"{cached['function_count']} changed functions")
+            if want_ghidra_mcp and not trace.get("identify"):
+                from pipeline.ghidriff_runner import _start_mcp_background, _GHIDRA_PROJECTS_DIR
+                _base = f"ghidriff_{cve_id.replace('/', '-')}"
+                _proj_name = f"{_base}-{pre_path.name}-{post_path.name}"
+                _proj_dir = _GHIDRA_PROJECTS_DIR / _proj_name
+                _rep_idata = _proj_dir / f"{_proj_name}.rep" / "idata"
+                _gbf_files = list(_rep_idata.rglob("*.gbf")) if _rep_idata.is_dir() else []
+                _project_ready = bool(_gbf_files) and any(
+                    f.stat().st_size > 10 * 1024 * 1024 for f in _gbf_files)
+                mcp_server = _start_mcp_background(
+                    pre_path, post_path,
+                    project_dir=_proj_dir if _project_ready else None,
+                    project_name=_proj_name)
+        else:
+            _print(3, TOTAL_STEPS, "Running ghidriff (20-40 min)...")
+            try:
+                diff_path, mcp_server = run_ghidriff(
+                    pre_path, post_path, diffs_dir, cve_id.replace("/", "-"),
+                    start_mcp=want_ghidra_mcp)
+            except Exception as e:
+                print(f"  [!] {binary_name}: ghidriff failed ({str(e)[:120]})", flush=True)
+                return None
+            from pipeline.patch_identifier import parse_ghidriff_sections
+            fn_count = len(parse_ghidriff_sections(diff_path))
+            _print(3, TOTAL_STEPS, "Ghidriff",
+                   f"{fn_count} changed functions → {diff_path.name}")
+            trace.save("ghidriff", {"diff_path": str(diff_path), "function_count": fn_count})
+
+        # ── identify ──
+        _print(4, TOTAL_STEPS, "Identifying patch function...")
+        patch_result = None
+        cached = trace.get("identify") if reuse else None
+        if cached:
+            co = cached.get("co_patches", []) or []
+            co_str = (" + " + ", ".join(f"{c['name']} ({c['confidence']}%)" for c in co)) if co else ""
+            _print(4, TOTAL_STEPS, "Identify (cached)",
+                   f"{cached['function_name']} ({cached['confidence']}%){co_str}")
+            from pipeline.patch_identifier import PatchResult
+            patch_result = PatchResult(
+                function_name=cached["function_name"], confidence=cached["confidence"],
+                reasoning=cached["reasoning"], patch_type=cached["patch_type"],
+                full_diff=cached["full_diff"], candidates_evaluated=cached["candidates_evaluated"],
+                heuristic_scores=[], agent_evals=[], co_patches=co,
+                decompiled_pre=cached.get("decompiled_pre", ""),
+                decompiled_post=cached.get("decompiled_post", ""),
+                callers=cached.get("callers", []),
+                vulnerability_description=cached.get("vulnerability_description", ""),
+                fix_description=cached.get("fix_description", ""),
+                attack_vector=cached.get("attack_vector", ""))
+            if mcp_server:
+                mcp_server.stop(); mcp_server = None
+        else:
+            analysis_backend = None
+            if backend == "ghidra":
+                if mcp_server:
+                    ready_event = getattr(mcp_server, "_ready_event", None)
+                    start_error = getattr(mcp_server, "_start_error", [])
+                    if ready_event:
+                        print("  [mcp] waiting for MCP server to be ready ...", flush=True)
+                        ready_event.wait()
+                    if start_error:
+                        print(f"  [mcp] WARNING: MCP server failed ({start_error[0]}) — "
+                              "falling back to one-shot identify", flush=True)
+                        mcp_server = None
+                    elif mcp_server.pre and mcp_server.post:
+                        analysis_backend = make_backend("ghidra", ghidra_server=mcp_server)
+            else:
+                try:
+                    analysis_backend = make_backend(
+                        backend, pre_binary=pre_path, post_binary=post_path, cve_id=cve_id,
+                        ida_shutdown=ida_shutdown)
+                    analysis_backend.start()
+                except BackendError as e:
+                    _fail(f"{backend} backend unavailable: {e}")
+                except Exception as e:
+                    _fail(f"{backend} backend failed to start: {e}")
+            try:
+                if analysis_backend:
+                    from pipeline.patch_identifier import identify_patch_with_mcp
+                    patch_result = identify_patch_with_mcp(cve, diff_path, analysis_backend,
+                                                           allow_web=allow_web)
+                else:
+                    patch_result = identify_patch(cve, diff_path)
+                co = patch_result.co_patches or []
+                co_str = (" + " + ", ".join(f"{c['name']} ({c['confidence']}%)" for c in co)) if co else ""
+                _print(4, TOTAL_STEPS, "Identify",
+                       f"{patch_result.function_name} ({patch_result.confidence}%, "
+                       f"type={patch_result.patch_type}){co_str}")
+                trace.save("identify", {
+                    "function_name": patch_result.function_name,
+                    "confidence": patch_result.confidence, "reasoning": patch_result.reasoning,
+                    "patch_type": patch_result.patch_type, "full_diff": patch_result.full_diff,
+                    "candidates_evaluated": patch_result.candidates_evaluated,
+                    "heuristic_scores": patch_result.heuristic_scores,
+                    "agent_evals": patch_result.agent_evals, "co_patches": patch_result.co_patches,
+                    "decompiled_pre": patch_result.decompiled_pre,
+                    "decompiled_post": patch_result.decompiled_post,
+                    "callers": patch_result.callers,
+                    "vulnerability_description": patch_result.vulnerability_description,
+                    "fix_description": patch_result.fix_description,
+                    "attack_vector": patch_result.attack_vector})
+            except PatchNotFoundError as e:
+                print(f"  [!] {binary_name}: no patch identified ({e})", flush=True)
+                patch_result = None
+            except Exception as e:
+                print(f"  [!] {binary_name}: identification error ({str(e)[:120]})", flush=True)
+                patch_result = None
+            finally:
+                # Ghidra: stop the Java server. IDA: tear down tunnels, leave VM instances warm.
+                if analysis_backend:
+                    analysis_backend.stop()
+                elif mcp_server:
+                    mcp_server.stop()
+
+        if patch_result is None:
+            return None
+        return patch_result, diff_path, pre_build, post_build
 
     patch_result = None
-    cached = trace.get("identify")
-    if cached:
-        co = cached.get("co_patches", []) or []
-        co_str = ""
-        if co:
-            co_str = " + " + ", ".join(f"{c['name']} ({c['confidence']}%)" for c in co)
-        _print(4, TOTAL_STEPS, "Identify (cached)",
-               f"{cached['function_name']} ({cached['confidence']}%){co_str}")
-        from pipeline.patch_identifier import PatchResult
-        patch_result = PatchResult(
-            function_name=cached["function_name"],
-            confidence=cached["confidence"],
-            reasoning=cached["reasoning"],
-            patch_type=cached["patch_type"],
-            full_diff=cached["full_diff"],
-            candidates_evaluated=cached["candidates_evaluated"],
-            heuristic_scores=[],
-            agent_evals=[],
-            co_patches=co,
-            decompiled_pre=cached.get("decompiled_pre", ""),
-            decompiled_post=cached.get("decompiled_post", ""),
-            callers=cached.get("callers", []),
-            vulnerability_description=cached.get("vulnerability_description", ""),
-            fix_description=cached.get("fix_description", ""),
-            attack_vector=cached.get("attack_vector", ""),
-        )
-        # No MCP needed — stop server if it was started
-        if mcp_server:
-            mcp_server.stop()
-            mcp_server = None
-    else:
-        analysis_backend = None
-        if backend == "ghidra":
-            # Wait for MCP server to finish starting (ran concurrently with ghidriff)
-            if mcp_server:
-                ready_event = getattr(mcp_server, "_ready_event", None)
-                start_error = getattr(mcp_server, "_start_error", [])
-                if ready_event:
-                    print("  [mcp] waiting for MCP server to be ready ...", flush=True)
-                    ready_event.wait()
-                if start_error:
-                    print(f"  [mcp] WARNING: MCP server failed ({start_error[0]}) — "
-                          "falling back to one-shot identify", flush=True)
-                    mcp_server = None
-                elif mcp_server.pre and mcp_server.post:
-                    analysis_backend = make_backend("ghidra", ghidra_server=mcp_server)
-        else:
-            # IDA owns its own startup: upload, launch on the VM, open tunnels.
-            try:
-                analysis_backend = make_backend(
-                    backend, pre_binary=pre_path, post_binary=post_path, cve_id=cve_id,
-                    ida_shutdown=ida_shutdown,
-                )
-                analysis_backend.start()
-            except BackendError as e:
-                _fail(f"{backend} backend unavailable: {e}")
-            except Exception as e:
-                # Any other startup failure is fatal too — do not fall back to Ghidra.
-                _fail(f"{backend} backend failed to start: {e}")
+    diff_path = None
+    binary_name = None
+    target = None
+    pre_build = post_build = None
+    attempts: list[str] = []
 
-        try:
-            if analysis_backend:
-                from pipeline.patch_identifier import identify_patch_with_mcp
-                patch_result = identify_patch_with_mcp(cve, diff_path, analysis_backend,
-                                                       allow_web=allow_web)
-            else:
-                patch_result = identify_patch(cve, diff_path)
+    for attempt_i, (cand_bin, cand_target) in enumerate(work, 1):
+        reuse = (trace.get("binaries") or {}).get("binary_name") == cand_bin
+        if not reuse:
+            for _k in ("binaries", "ghidriff", "identify", "blog"):
+                trace.clear(_k)
+        print(f"  [binary {attempt_i}/{len(work)}] {cand_bin} "
+              f"({cand_target.lineage}.{cand_target.revision})", flush=True)
+        result = _attempt(cand_bin, cand_target, reuse)
+        if result is None:
+            attempts.append(f"{cand_bin}: no identifiable patch")
+            for _k in ("binaries", "ghidriff", "identify", "blog"):
+                trace.clear(_k)
+            continue
 
-            co = patch_result.co_patches or []
-            co_str = ""
-            if co:
-                co_str = " + " + ", ".join(f"{c['name']} ({c['confidence']}%)" for c in co)
-            _print(4, TOTAL_STEPS, "Identify",
-                   f"{patch_result.function_name} ({patch_result.confidence}%, "
-                   f"type={patch_result.patch_type}){co_str}")
-            trace.save("identify", {
-                "function_name": patch_result.function_name,
-                "confidence": patch_result.confidence,
-                "reasoning": patch_result.reasoning,
-                "patch_type": patch_result.patch_type,
-                "full_diff": patch_result.full_diff,
-                "candidates_evaluated": patch_result.candidates_evaluated,
-                "heuristic_scores": patch_result.heuristic_scores,
-                "agent_evals": patch_result.agent_evals,
-                "co_patches": patch_result.co_patches,
-                "decompiled_pre": patch_result.decompiled_pre,
-                "decompiled_post": patch_result.decompiled_post,
-                "callers": patch_result.callers,
-                "vulnerability_description": patch_result.vulnerability_description,
-                "fix_description": patch_result.fix_description,
-                "attack_vector": patch_result.attack_vector,
-            })
-        except PatchNotFoundError as e:
-            # No back-compat "full diff" fallback: a diff with no identifiable patch must
-            # not be turned into a report. Fail loudly (unresolved) instead of guessing.
-            if analysis_backend:
-                analysis_backend.stop()
-            elif mcp_server:
-                mcp_server.stop()
-            _fail(f"No patch identified for {cve_id}: {e} — refusing to emit an unverified report")
-        except Exception as e:
-            if analysis_backend:
-                analysis_backend.stop()
-            elif mcp_server:
-                mcp_server.stop()
-            _fail(f"Patch identification error for {cve_id}: {e}")
-        finally:
-            # Ghidra: shuts the Java server down. IDA: tears down the SSH
-            # tunnels but deliberately leaves the VM instances running so the
-            # next run can reuse the analysed databases.
-            if analysis_backend:
-                analysis_backend.stop()
-            elif mcp_server:
-                mcp_server.stop()
-            mcp_server = None
+        cand_patch, cand_diff, cand_pre, cand_post = result
+        ok, reasons = validate_patch(cve, ground_truth, cand_patch)
+        for r in reasons:
+            print(f"       validate: {r}")
+        if ok:
+            patch_result, diff_path = cand_patch, cand_diff
+            pre_build, post_build = cand_pre, cand_post
+            binary_name, target = cand_bin, cand_target
+            break
 
-    # ── Step 4b: Validate the candidate against the CVE's ground truth ──────────
-    # The gate that stops invalid reports: the identified function must match the CVE's
-    # stated bug class, contain a real (non-relocation) change, and straddle the fix build.
+        fails = [r for r in reasons if r.startswith("FAIL")]
+        attempts.append(f"{cand_bin}:{cand_patch.function_name} declined ({'; '.join(fails)})")
+        print(f"  [!] validator declined {cand_patch.function_name} in {cand_bin} "
+              f"— trying next candidate binary", flush=True)
+        for _k in ("binaries", "ghidriff", "identify", "blog"):
+            trace.clear(_k)
+
     if patch_result is None:
-        _fail(f"No patch identified for {cve_id} — refusing to emit an unverified report")
-    ok, reasons = validate_patch(cve, ground_truth, patch_result)
-    for r in reasons:
-        print(f"       validate: {r}")
-    if not ok:
-        _fail(f"{cve_id}: {patch_result.function_name} did NOT validate against the CVE "
-              f"(bug class / real-change mismatch) — refusing to emit an unverified report")
+        _fail(f"{cve_id}: no candidate binary produced a validated patch after "
+              f"{len(work)} attempt(s) — refusing to emit an unverified report. "
+              f"Tried: {' | '.join(attempts)}")
+
 
     # ── Step 5: Generate blog post ─────────────────────────────────────────────
     if skip_blog:
