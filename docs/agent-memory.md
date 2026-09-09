@@ -46,3 +46,34 @@ When one month's update fixes several CVEs in the same binary, disambiguate by
 with the MSRC affected-build list, and the CVE that only affects some branches
 is the function that only appears in those branches' deltas. Combine with the
 `Feature_*` rule above — the newly added gate marks the real fix.
+
+## CVE-2026-49798 — real patch is clfs.sys, not the published ntoskrnl pick
+
+The pipeline published `ntoskrnl.exe!WheaRemoveErrorSource` (45% conf) for
+CVE-2026-49798 (CWE-416 UAF, "Windows Kernel" local EoP, KB5099539). **That is
+wrong.** Verified via IDA + ghidriff:
+
+- The `ntoskrnl.exe` 7417→7548 delta (correct June→July pair; 7548=2026-07-14)
+  is 99.99% identical: 4 code-changed functions, all just *removing* the WHEA
+  killswitches `Feature_2504257848 / 1162080569 / 3858493753` (introduced back
+  in 7181/April). Pure CFR cleanup — see the `Feature_*` Rule 1 above. No July
+  UAF fix exists in `ntoskrnl.exe`.
+- The real fix is in **`clfs.sys`**, which the pipeline never diffs (Rule 2 of
+  build/binary selection). `clfs.sys` was serviced in July (7548) but **not**
+  June — its 7291→7548 delta is one tight change: 4 modified + 3 added
+  functions, all gated by a **newly added** `Feature_796637497`.
+- Patch function: **`CClfsBaseFileSnapshot::CopyImage`** (co-patches
+  `CClfsLogFcbPhysical::AppendLog`, new helper `RawSectorAlign`). The gated
+  logic does a **save→NULL→restore** of each `_CLFS_CONTAINER_CONTEXT` pointer
+  at offset **+0x18** around the `ClfsEncodeBlock`/`memmove`/`ClfsDecodeBlock`
+  image copy, so the dangling container-context pointer is not dereferenceable
+  during the snapshot copy — the UAF-lifetime fix.
+
+**Why the pipeline failed here:** (1) it diffs only `ntoskrnl.exe` so it never
+saw `clfs.sys`; (2) `validate._has_security_signal` treats *any* `Feature_*`
+gate in the diff as a fix signal, so it rewarded the WHEA gate-*removal* noise
+(Rule 1) and the MCP path accepted a 45%-confidence pick with no confidence
+floor. **How to apply:** for a "Windows Kernel" UAF whose `ntoskrnl.exe` delta
+is only gate-removal/relocation, diff the kernel drivers too (`clfs.sys`,
+`cng.sys`, …); the binary serviced *this* month but not last month, carrying a
+newly-added `Feature_*` gate, is the real fix.
